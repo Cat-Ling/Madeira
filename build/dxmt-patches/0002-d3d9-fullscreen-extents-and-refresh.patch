@@ -1,0 +1,40 @@
+diff --git a/src/d3d9/d3d9_interface.cpp b/src/d3d9/d3d9_interface.cpp
+index 52c183f..06b7e56 100644
+--- a/src/d3d9/d3d9_interface.cpp
++++ b/src/d3d9/d3d9_interface.cpp
+@@ -147,21 +147,25 @@ static const struct {
+   UINT width;
+   UINT height;
+ } kPresentableExtents[] = {
+-    {320, 240},  {512, 384},  {640, 400},  {640, 480},  {720, 480},   {800, 600},
+-    {1024, 768}, {1152, 864}, {1280, 720}, {1280, 960}, {1280, 1024},
++    {320, 240},   {512, 384},   {640, 360},   {640, 400},   {640, 480},   {720, 480},
++    {720, 576},   {800, 480},   {800, 600},   {848, 480},   {854, 480},   {960, 540},
++    {960, 600},   {960, 720},   {1024, 576},  {1024, 600},  {1024, 640},  {1024, 768},
++    {1120, 832},  {1152, 648},  {1152, 864},  {1176, 664},  {1280, 720},  {1280, 768},
++    {1280, 800},  {1280, 960},  {1280, 1024}, {1360, 768},  {1366, 768},  {1400, 1050},
++    {1440, 900},  {1600, 900},  {1600, 1024}, {1600, 1200}, {1680, 1050}, {1920, 1080},
++    {1920, 1200}, {2048, 1536}, {2560, 1440},
+ };
+ 
+-// Whether a fullscreen present may name this extent. The refresh rate is matched
+-// only when the app pins a nonzero FullScreen_RefreshRateInHz, and only against a
+-// real mode: a scaled extent carries no refresh rate of its own.
++// Whether a fullscreen present may name this extent. Because this backend
++// composites and scales into the existing layer rather than switching physical
++// refresh rates, any refreshRate requested for an adapter mode or standard
++// extent is accepted rather than rejected on a 60 Hz mismatch.
+ static bool
+ isPresentableFullscreenExtent(UINT adapter, UINT width, UINT height, UINT refreshRate) {
++  (void)refreshRate;
+   for (const auto &m : adapterModes(adapter)) {
+-    if (m.width != width || m.height != height)
+-      continue;
+-    if (refreshRate != 0 && refreshRateHzOr60(m) != refreshRate)
+-      continue;
+-    return true;
++    if (m.width == width && m.height == height)
++      return true;
+   }
+   return std::any_of(std::begin(kPresentableExtents), std::end(kPresentableExtents), [&](const auto &e) {
+     return e.width == width && e.height == height;

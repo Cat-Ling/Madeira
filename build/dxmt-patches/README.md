@@ -12,6 +12,7 @@ patch that is already applied, and `apply.sh --revert` takes them out. The
 | Patch | What it fixes |
 |---|---|
 | `0001-d3d9-index-range-per-draw.patch` | A 32-bit Direct3D 9 indexed draw copies only the index bytes it reads, instead of the whole index buffer before every draw after a lock (Call of Duty: Black Ops drew at 2 to 20 FPS). `env.MADEIRA_D3D9_INDEX_RANGE = 0` goes back to the whole copy. Checked by `tests/host/check-d3d9-index-range.py` |
+| `0002-d3d9-fullscreen-extents-and-refresh.patch` | Fullscreen D3D9 `CreateDevice` / `Reset` matches adapter modes by width and height regardless of `FullScreen_RefreshRateInHz` (fixing 30/50/59/75/120 Hz requests on synthetic 60 Hz virtual monitor modes like Fit resolutions) and accepts all 37 standard PC extents plus 320x240 and 512x384 in `kPresentableExtents`. |
 
 A patch must apply on the current `dxmt` pin. When the pin moves, rebase the
 patches onto it (or drop a patch the new pin already covers).
