@@ -169,6 +169,17 @@ if [ ${#GNUTLS_DEFS[@]} -gt 0 ]; then
 fi
 # OpenGL: opengl32's unix side (wrappers + generated thunks). It dispatches to
 # win32u's WGL layer, whose iOS driver is build/win32u-unix/opengl_ios.c.
+WINE_OPENGL_PATCH="$REPO_ROOT/patches/wine-opengl-winios.patch"
+[ -f "$WINE_OPENGL_PATCH" ] || { echo "ERROR: missing $WINE_OPENGL_PATCH" >&2; exit 1; }
+if git -C "$WINE_SRC" apply --reverse --check "$WINE_OPENGL_PATCH" 2>/dev/null; then
+    echo "wine-opengl-winios: already applied"
+elif git -C "$WINE_SRC" apply --check "$WINE_OPENGL_PATCH" 2>/dev/null; then
+    git -C "$WINE_SRC" apply "$WINE_OPENGL_PATCH"
+    echo "wine-opengl-winios: applied"
+else
+    echo "ERROR: wine-opengl-winios.patch does not apply cleanly to $WINE_SRC" >&2
+    exit 1
+fi
 compile_unixlib "$WINE_SRC/dlls/opengl32/unix_wgl.c" "opengl32_wgl" "opengl32" \
     -I"$WINE_SRC/dlls/opengl32"
 compile_unixlib "$WINE_SRC/dlls/opengl32/unix_thunks.c" "opengl32_thunks" "opengl32" \

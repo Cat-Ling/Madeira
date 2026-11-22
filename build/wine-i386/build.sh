@@ -42,6 +42,18 @@ LOG="$B/madeira-i386-build.log"
 
 [ -x "$STRIP" ] || { echo "llvm-mingw not found at $TC (docs/BUILDING.md)" >&2; exit 1; }
 
+WINE_OPENGL_PATCH="$R/patches/wine-opengl-winios.patch"
+[ -f "$WINE_OPENGL_PATCH" ] || { echo "ERROR: missing $WINE_OPENGL_PATCH" >&2; exit 1; }
+if git -C "$R/wine" apply --reverse --check "$WINE_OPENGL_PATCH" 2>/dev/null; then
+    echo "wine-opengl-winios: already applied"
+elif git -C "$R/wine" apply --check "$WINE_OPENGL_PATCH" 2>/dev/null; then
+    git -C "$R/wine" apply "$WINE_OPENGL_PATCH"
+    echo "wine-opengl-winios: applied"
+else
+    echo "ERROR: wine-opengl-winios.patch does not apply cleanly to $R/wine" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------- configure
 # Its own tree, like build-arm64ec: reconfiguring build-macos with an extra
 # arch would regenerate every module Makefile the ntdll-unix build relies on.
