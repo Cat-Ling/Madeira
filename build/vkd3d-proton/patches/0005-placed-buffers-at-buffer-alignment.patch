@@ -1,0 +1,42 @@
+resource: a placed buffer may sit at any offset the buffer minimum allows (NutsEmu)
+
+A placed buffer is a slice of its heap's own buffer, so its offset only has to meet the buffer
+minimum (256 bytes), not the 64 KB placement alignment. Subnautica 2 (Unreal Engine 5) placed a
+1808-byte UAV buffer off the 64 KB alignment in a default heap, got E_INVALIDARG from
+CreatePlacedResource and ended with a fatal error as it loaded (2026-10-20). The first such
+buffer is logged with its offset; textures, and buffers off the 256-byte minimum, are still
+refused, now with an ERR saying why.
+
+Generated-by: LLM
+
+--- a/libs/vkd3d/resource.c	2026-10-20 17:54:52
++++ b/libs/vkd3d/resource.c	2026-10-20 17:54:52
+@@ -4696,10 +4696,25 @@
+         goto fail;
+     }
+ 
+-    if (heap_offset & (object->placed_alignment - 1u))
++    /* NutsEmu: a placed buffer is a slice of the heap's own buffer (below), so any offset the
++     * buffer minimum allows works; Subnautica 2 (Unreal Engine 5) placed a 1808-byte UAV buffer
++     * off the 64 KB alignment, got E_INVALIDARG and ended with a fatal error as it loaded
++     * (2026-10-20). The first one is logged with its offset. */
++    if ((heap_offset & (object->placed_alignment - 1u)) && !d3d12_resource_is_texture(object) &&
++            !(heap_offset & (VKD3D_MIN_BUFFER_ALIGNMENT - 1u)))
+     {
+-        WARN("Heap offset %#"PRIx64" not a multiple of resource alignment %#"PRIx64".\n",
+-                heap_offset, object->placed_alignment);
++        static bool logged;
++        if (!logged)
++        {
++            logged = true;
++            ERR("NutsEmu: buffer placed at heap offset %#"PRIx64", not a multiple of %#"PRIx64": allowed (buffer slice).\n",
++                    heap_offset, object->placed_alignment);
++        }
++    }
++    else if (heap_offset & (object->placed_alignment - 1u))
++    {
++        ERR("Heap offset %#"PRIx64" not a multiple of resource alignment %#"PRIx64" (dim %u, width %"PRIu64", flags %#x).\n",
++                heap_offset, object->placed_alignment, desc->Dimension, desc->Width, desc->Flags);
+         hr = E_INVALIDARG;
+         goto fail;
+     }

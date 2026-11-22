@@ -1,0 +1,107 @@
+heap, resource: big GPU allocations logged (NutsEmu)
+
+Subnautica 2's graphics memory went from 1.9 to 5.4 GB as it loaded its world, with a 300 MB
+texture pool and at 50% render resolution, and the 12 GB iPhone ran out (2026-10-20). To see
+which of a game's pools those are: heaps of 32 MB or more (size, type, flags, running total),
+and committed or placed resources of 32 MB or more (buffers) or 8M texels or more (textures),
+with their shape and format, as ERR lines "NutsEmu big ...", at most 400 of each.
+
+Generated-by: LLM
+
+--- a/libs/vkd3d/heap.c	2026-10-20 20:01:04
++++ b/libs/vkd3d/heap.c	2026-10-20 20:01:04
+@@ -403,12 +403,45 @@
+     return S_OK;
+ }
+ 
++/* NutsEmu: the big GPU allocations, to see which of a game's pools fill the phone's memory
++ * (Subnautica 2's graphics went from 1.9 to 5.4 GB as it loaded its world, at any texture pool
++ * or render resolution, 2026-10-20). Heaps of 32 MB or more, and committed or placed resources
++ * of 32 MB or more (buffers) or 8M texels or more (textures); at most 400 lines. */
++static void nutsemu_note_big(const char *what, const D3D12_RESOURCE_DESC1 *desc, uint64_t heap_size, uint32_t heap_flags,
++        uint32_t heap_type)
++{
++    static LONG lines;
++    static uint64_t total;
++    uint64_t texels;
++
++    if (desc)
++    {
++        texels = desc->Width * (uint64_t)desc->Height * (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? desc->DepthOrArraySize : 1u);
++        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc->Width < (32u << 20) : texels < (8u << 20))
++            return;
++    }
++    else if (heap_size < (32u << 20))
++        return;
++    if (InterlockedIncrement(&lines) > 400)
++        return;
++    if (desc)
++        ERR("NutsEmu big %s: dim %u, %"PRIu64" x %u x %u, mips %u, format %u, flags %#x\n", what, desc->Dimension,
++                desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels, desc->Format, desc->Flags);
++    else
++    {
++        total += heap_size;
++        ERR("NutsEmu big %s: %"PRIu64" MB, type %u, flags %#x (heaps so far %"PRIu64" MB)\n", what, heap_size >> 20,
++                heap_type, heap_flags, total >> 20);
++    }
++}
++
+ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
+         void* host_address, struct d3d12_heap **heap)
+ {
+     struct d3d12_heap *object;
+     HRESULT hr;
+ 
++    nutsemu_note_big("heap", NULL, desc->SizeInBytes, desc->Flags, desc->Properties.Type);  /* NutsEmu */
+     if (!(object = vkd3d_malloc(sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+--- a/libs/vkd3d/resource.c	2026-10-20 20:01:04
++++ b/libs/vkd3d/resource.c	2026-10-20 20:01:15
+@@ -4370,6 +4370,8 @@
+     return hr;
+ }
+ 
++static void nutsemu_note_big_resource(const char *what, const D3D12_RESOURCE_DESC1 *desc);  /* NutsEmu, below */
++
+ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+@@ -4380,6 +4382,7 @@
+     struct d3d12_resource *object;
+     HRESULT hr;
+ 
++    nutsemu_note_big_resource("committed", desc);  /* NutsEmu */
+     if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_COMMITTED | VKD3D_RESOURCE_ALLOCATION,
+             desc, heap_properties, heap_flags, initial_state, optimized_clear_value,
+             num_castable_formats, castable_formats,
+@@ -4633,6 +4636,21 @@
+     return S_OK;
+ }
+ 
++/* NutsEmu: big committed and placed resources (heap.c's nutsemu_note_big) */
++static void nutsemu_note_big_resource(const char *what, const D3D12_RESOURCE_DESC1 *desc)
++{
++    static LONG lines;
++    uint64_t texels = desc->Width * (uint64_t)desc->Height *
++            (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? desc->DepthOrArraySize : 1u);
++
++    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc->Width < (32u << 20) : texels < (8u << 20))
++        return;
++    if (InterlockedIncrement(&lines) > 400)
++        return;
++    ERR("NutsEmu big %s: dim %u, %"PRIu64" x %u x %u, mips %u, format %u, flags %#x\n", what, desc->Dimension,
++            desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels, desc->Format, desc->Flags);
++}
++
+ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+         struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+@@ -4650,6 +4668,7 @@
+ 
+     if (FAILED(hr = d3d12_resource_validate_heap(desc, heap)))
+         return hr;
++    nutsemu_note_big_resource("placed", desc);  /* NutsEmu */
+ 
+     if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
+     {

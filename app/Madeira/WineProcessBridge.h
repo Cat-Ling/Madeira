@@ -59,6 +59,10 @@ int madeira_write_continue_flag(void);
 // Madeira Dock's component setup calls it before writing Steam's registry keys.
 void madeira_seed_prefix_if_needed(const char *prefix_path);
 
+// Open an http://, https://, or mailto: URL via UIApplication on the host.
+// Returns 1 if accepted and dispatched, 0 otherwise.
+int wine_host_open_url(const char *url);
+
 #ifdef __cplusplus
 }
 #endif

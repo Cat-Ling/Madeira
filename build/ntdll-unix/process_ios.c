@@ -58,6 +58,9 @@
 # include <libprocstat.h>
 #endif
 #include <unistd.h>
+#ifdef WINE_IOS
+#include <dlfcn.h>
+#endif
 #ifdef HAVE_MACH_MACH_H
 # include <mach/mach.h>
 #endif
@@ -1015,6 +1018,24 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 {
 #ifdef WINE_IOS
+    if (argv)
+    {
+        static int (*host_open_url)( const char *url );
+        static int looked;
+        int n = 0;
+
+        while (argv[n]) n++;
+        if (!looked)
+        {
+            host_open_url = dlsym( RTLD_DEFAULT, "wine_host_open_url" );
+            looked = 1;
+        }
+        if (host_open_url && n >= 2 &&
+            (!strncmp( argv[n - 1], "http://", 7 ) || !strncmp( argv[n - 1], "https://", 8 ) ||
+             !strncmp( argv[n - 1], "mailto:", 7 )) &&
+            host_open_url( argv[n - 1] ))
+            return STATUS_SUCCESS;
+    }
     /* No fork/exec on iOS */
     return STATUS_NOT_SUPPORTED;
 #else

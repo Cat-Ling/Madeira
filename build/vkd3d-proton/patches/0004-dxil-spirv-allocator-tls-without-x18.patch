@@ -1,0 +1,103 @@
+dxil-spirv: the thread allocator in a Windows TLS slot (NutsEmu)
+
+Compiler-generated thread_local finds the TEB through x18, which iOS doesn't keep, so every
+access faults and Wine emulates it (Wine 0016). dxil-spirv's allocate_in_thread and
+free_in_thread read their thread_local on every allocation: translating GTA V Enhanced's
+shaders spent about 70% of the time in those faults (2026-10-16). Built with
+WINE_TEB_TSD_SLOT, the allocator pointer lives in a Windows TLS slot (TlsGetValue finds the
+TEB through NutsEmu's TSD slot, no fault); the last error TlsGetValue clears is put back.
+
+--- a/subprojects/dxil-spirv/util/thread_local_allocator.cpp
++++ b/subprojects/dxil-spirv/util/thread_local_allocator.cpp
+@@ -26,6 +26,10 @@
+ #include <assert.h>
+ #include <stdint.h>
+ #include <memory>
++#if defined(WINE_TEB_TSD_SLOT) || defined(_WIN32)
++#define NOMINMAX
++#include <windows.h>
++#endif
+ 
+ namespace dxil_spv
+ {
+@@ -81,7 +85,35 @@
+ 		return nullptr;
+ }
+ 
++#if defined(WINE_TEB_TSD_SLOT) || defined(_WIN32)
++// NutsEmu: the allocator in a Windows TLS slot, not a thread_local. Compiler TLS finds the TEB
++// through x18, which iOS doesn't keep, so every access faulted and was emulated (Wine 0016):
++// translating GTA V Enhanced's shaders spent ~70% of its time in those faults (2026-10-16).
++// TlsGetValue finds the TEB through NutsEmu's TSD slot (no fault); it clears the last error,
++// as on Windows, so that is put back.
++static DWORD allocator_slot = TlsAlloc();
++static inline ChainAllocator *get_allocator()
++{
++	DWORD error = GetLastError();
++	auto *a = static_cast<ChainAllocator *>(TlsGetValue(allocator_slot));
++	SetLastError(error);
++	return a;
++}
++static inline void set_allocator(ChainAllocator *a)
++{
++	TlsSetValue(allocator_slot, a);
++}
++#else
+ static thread_local ChainAllocator *allocator;
++static inline ChainAllocator *get_allocator()
++{
++	return allocator;
++}
++static inline void set_allocator(ChainAllocator *a)
++{
++	allocator = a;
++}
++#endif
+ 
+ void ChainAllocator::reset()
+ {
+@@ -124,6 +156,7 @@
+ 
+ void *allocate_in_thread(size_t size)
+ {
++	ChainAllocator *allocator = get_allocator();
+ 	if (!allocator)
+ 		return malloc(size);
+ 
+@@ -132,7 +165,7 @@
+ 
+ void free_in_thread(void *ptr)
+ {
+-	if (!allocator)
++	if (!get_allocator())
+ 	{
+ 		free(ptr);
+ 		return;
+@@ -143,20 +176,20 @@
+ 
+ void begin_thread_allocator_context()
+ {
+-	assert(!allocator);
+-	allocator = new ChainAllocator;
++	assert(!get_allocator());
++	set_allocator(new ChainAllocator);
+ }
+ 
+ void end_thread_allocator_context()
+ {
+-	assert(allocator);
+-	delete allocator;
+-	allocator = nullptr;
++	assert(get_allocator());
++	delete get_allocator();
++	set_allocator(nullptr);
+ }
+ 
+ void reset_thread_allocator_context()
+ {
+-	assert(allocator);
+-	allocator->reset();
++	assert(get_allocator());
++	get_allocator()->reset();
+ }
+ }

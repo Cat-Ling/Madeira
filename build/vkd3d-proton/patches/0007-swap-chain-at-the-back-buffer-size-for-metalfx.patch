@@ -1,0 +1,44 @@
+swapchain: a back buffer smaller than the window gets a swap chain of its own size while NutsEmu Upscaling's MetalFX is on (NutsEmu)
+
+vkd3d-proton makes its Vulkan swap chain the window's size and stretches the game's back buffer
+into it with its own linear blit, so the Metal WSI never saw a smaller image to upscale. With
+DXMT_METALFX_SPATIAL_SWAPCHAIN=1 (NutsEmu Upscaling's switch, as for Direct3D 11) a back buffer
+smaller than the window gets a swap chain of its own size; Mesa 0033 then scales it up to the
+window with MetalFX's spatial scaler.
+
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2082,6 +2082,7 @@
+     uint32_t override_image_count;
+     bool new_occlusion_state;
+     char count_env[16];
++    char metalfx_env[8];
+     VkResult vr;
+     uint32_t i;
+ 
+@@ -2223,6 +2224,25 @@
+     swapchain_create_info.imageExtent.height = max(swapchain_create_info.imageExtent.height, surface_caps.minImageExtent.height);
+     swapchain_create_info.imageExtent.height = min(swapchain_create_info.imageExtent.height, surface_caps.maxImageExtent.height);
+ 
++    /* NutsEmu: with NutsEmu Upscaling's MetalFX switch on (DXMT_METALFX_SPATIAL_SWAPCHAIN=1), a back
++     * buffer smaller than the window gets a swap chain of its own size, so the blit below copies it
++     * as it is and the Metal WSI scales it up to the window with MetalFX (Mesa 0033), not this blit
++     * stretching it linearly. */
++    vkd3d_get_env_var("DXMT_METALFX_SPATIAL_SWAPCHAIN", metalfx_env, sizeof(metalfx_env));
++    if (!strcmp(metalfx_env, "1") && chain->desc.Scaling != DXGI_SCALING_NONE &&
++            chain->desc.Width && chain->desc.Height &&
++            chain->desc.Width <= swapchain_create_info.imageExtent.width &&
++            chain->desc.Height <= swapchain_create_info.imageExtent.height &&
++            (chain->desc.Width < swapchain_create_info.imageExtent.width ||
++             chain->desc.Height < swapchain_create_info.imageExtent.height))
++    {
++        INFO("NutsEmu: swap chain at the back buffer's %ux%u for MetalFX to upscale to %ux%u.\n",
++                chain->desc.Width, chain->desc.Height,
++                swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height);
++        swapchain_create_info.imageExtent.width = max(chain->desc.Width, surface_caps.minImageExtent.width);
++        swapchain_create_info.imageExtent.height = max(chain->desc.Height, surface_caps.minImageExtent.height);
++    }
++
+     if (chain->queue->device->vk_info.NV_low_latency2)
+     {
+         memset(&swapchain_latency_create_info, 0, sizeof(swapchain_latency_create_info));

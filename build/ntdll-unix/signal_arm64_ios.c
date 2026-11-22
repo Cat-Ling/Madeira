@@ -44,7 +44,9 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <string.h>
 #include <sys/sysctl.h>
+#include <time.h>
 
 /* iOS-Madeira ml674: XZR/WZR AS A STORE SOURCE MUST READ ZERO.
  *
@@ -16485,6 +16487,170 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 }
 
 
+#ifdef WINE_IOS
+/* NutsEmu 0190: every Windows program runs inside the host process, so they
+ * and the UI share one host allocator, Objective-C runtime and dyld. Defer
+ * SIGUSR1 suspension via a helper thread if a thread's Unix call stack is
+ * inside one of them so the UI does not deadlock on a suspended thread's lock. */
+static struct { ULONG_PTR start, end; } ios_lock_code[8];
+static unsigned int ios_lock_code_count;
+static semaphore_t ios_resuspend_sem;
+static BOOL ios_resuspend_ready;
+#define IOS_RESUSPEND_SLOTS 128
+static LONG ios_resuspend_slots[IOS_RESUSPEND_SLOTS];
+static LONG ios_resuspend_count;
+extern int __pthread_kill( mach_port_t, int );
+
+static inline ULONG_PTR ios_strip_pac( ULONG_PTR addr )
+{
+#ifdef __aarch64__
+    register ULONG_PTR x30 __asm__("x30") = addr;
+    __asm__ volatile( "hint #7" : "+r"(x30) );  /* xpaclri */
+    return x30;
+#else
+    return addr;
+#endif
+}
+
+static inline BOOL ios_in_lock_code( ULONG_PTR addr )
+{
+    unsigned int i;
+    addr = ios_strip_pac( addr );
+    for (i = 0; i < ios_lock_code_count; i++)
+        if (addr >= ios_lock_code[i].start && addr < ios_lock_code[i].end) return TRUE;
+    return FALSE;
+}
+
+static BOOL ios_inside_lock_code( ucontext_t *sigcontext )
+{
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    ULONG_PTR lo = (ULONG_PTR)data->kernel_stack, hi = lo + kernel_stack_size;
+    ULONG_PTR fp = FP_sig(sigcontext);
+    unsigned int i;
+
+    if (!ios_lock_code_count) return FALSE;
+    if (ios_in_lock_code( PC_sig(sigcontext) ) || ios_in_lock_code( LR_sig(sigcontext) )) return TRUE;
+    for (i = 0; i < 64; i++)
+    {
+        ULONG_PTR next;
+        if (fp < lo || fp + 16 > hi || (fp & 7)) break;
+        if (ios_in_lock_code( ((ULONG_PTR *)fp)[1] )) return TRUE;
+        next = ((ULONG_PTR *)fp)[0];
+        if (next <= fp) break;
+        fp = next;
+    }
+    return FALSE;
+}
+
+static BOOL ios_resuspend_later(void)
+{
+    mach_port_t port;
+    unsigned int i;
+
+    if (!ios_resuspend_ready) return FALSE;
+    port = mach_thread_self();
+    for (i = 0; i < IOS_RESUSPEND_SLOTS; i++)
+        if (__sync_bool_compare_and_swap( &ios_resuspend_slots[i], 0, (LONG)port )) break;
+    if (i == IOS_RESUSPEND_SLOTS)
+    {
+        mach_port_deallocate( mach_task_self(), port );
+        return FALSE;
+    }
+    __sync_add_and_fetch( &ios_resuspend_count, 1 );
+    semaphore_signal( ios_resuspend_sem );
+    return TRUE;
+}
+
+static void ios_write_resuspend_count( LONG count )
+{
+    static const char head[] = "wine: suspend held back while a thread was inside the host allocator, runtime or loader (";
+    static const char tail[] = " so far)\n";
+    char buf[sizeof(head) + 16 + sizeof(tail)], digits[12];
+    unsigned int n = 0, d = 0;
+    ULONG value = (ULONG)count;
+
+    memcpy( buf, head, sizeof(head) - 1 );
+    n = sizeof(head) - 1;
+    do { digits[d++] = '0' + value % 10; value /= 10; } while (value && d < sizeof(digits));
+    while (d) buf[n++] = digits[--d];
+    memcpy( buf + n, tail, sizeof(tail) - 1 );
+    n += sizeof(tail) - 1;
+    write( 2, buf, n );
+}
+
+static void *ios_resuspend_thread( void *arg )
+{
+    LONG logged = 0;
+    (void)arg;
+
+    for (;;)
+    {
+        struct timespec delay = { 0, 1000000 };
+        unsigned int i;
+        LONG count;
+
+        if (semaphore_wait( ios_resuspend_sem ) != KERN_SUCCESS) continue;
+        nanosleep( &delay, NULL );
+        for (i = 0; i < IOS_RESUSPEND_SLOTS; i++)
+        {
+            mach_port_t port = (mach_port_t)__atomic_exchange_n( &ios_resuspend_slots[i], 0, __ATOMIC_SEQ_CST );
+            if (!port) continue;
+            __pthread_kill( port, SIGUSR1 );
+            mach_port_deallocate( mach_task_self(), port );
+        }
+        count = __atomic_load_n( &ios_resuspend_count, __ATOMIC_RELAXED );
+        if (count != logged && (logged < 20 || count / 1000 != logged / 1000))
+        {
+            ios_write_resuspend_count( count );
+            logged = count;
+        }
+    }
+    return NULL;
+}
+
+static void ios_init_resuspend_impl(void)
+{
+    static const char * const names[] =
+        { "/libsystem_malloc.dylib", "/libobjc.A.dylib", "/libdyld.dylib" };
+    uint32_t i, j, count = _dyld_image_count();
+    pthread_attr_t attr;
+    pthread_t thread;
+
+    for (i = 0; i < count && ios_lock_code_count < ARRAY_SIZE(ios_lock_code); i++)
+    {
+        const char *name = _dyld_get_image_name( i );
+        size_t len = name ? strlen( name ) : 0;
+        for (j = 0; j < ARRAY_SIZE(names) && ios_lock_code_count < ARRAY_SIZE(ios_lock_code); j++)
+        {
+            size_t nlen = strlen( names[j] );
+            const struct mach_header_64 *header;
+            unsigned long size = 0;
+            uint8_t *text;
+
+            if (len < nlen || strcmp( name + len - nlen, names[j] )) continue;
+            header = (const struct mach_header_64 *)_dyld_get_image_header( i );
+            if (!header || !(text = getsegmentdata( header, "__TEXT", &size )) || !size) continue;
+            ios_lock_code[ios_lock_code_count].start = (ULONG_PTR)text;
+            ios_lock_code[ios_lock_code_count].end = (ULONG_PTR)text + size;
+            ios_lock_code_count++;
+        }
+    }
+    if (!ios_lock_code_count) return;
+    if (semaphore_create( mach_task_self(), &ios_resuspend_sem, SYNC_POLICY_FIFO, 0 ) != KERN_SUCCESS) return;
+    pthread_attr_init( &attr );
+    pthread_attr_setstacksize( &attr, 64 * 1024 );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (!pthread_create( &thread, &attr, ios_resuspend_thread, NULL )) ios_resuspend_ready = TRUE;
+    pthread_attr_destroy( &attr );
+}
+
+static void ios_init_resuspend(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once( &once, ios_init_resuspend_impl );
+}
+#endif
+
 /**********************************************************************
  *		usr1_handler
  *
@@ -16506,6 +16672,10 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #endif
     if (is_inside_syscall( SP_sig(ucontext) ))
     {
+#if defined(__APPLE__) && defined(WINE_IOS)
+        if (ios_inside_lock_code( ucontext ) && ios_resuspend_later())
+            return;
+#endif
         context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
         NtGetContextThread( GetCurrentThread(), &context );
         wait_suspend( &context );
@@ -16639,6 +16809,7 @@ void signal_init_process(void)
         pthread_key_create(&ios_teb_tls_key, NULL);
         ios_teb_tls_key_created = 1;
     }
+    ios_init_resuspend();
 #endif
 
     sig_act.sa_mask = server_block_set;

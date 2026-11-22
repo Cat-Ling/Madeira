@@ -1,0 +1,51 @@
+query pools: smaller occlusion reservations on KosmicKrisp (NutsEmu)
+
+KosmicKrisp's visibility table has 32768 slots, reserved at query-pool creation.
+The default 4096-query batch allows only eight pools, including mostly unused
+slots held by command allocators. GTA V Enhanced repeatedly exhausts the table
+when its world loads. Use 256-query batches on this driver; command allocators
+already use the actual query_count and obtain another pool when one fills.
+Keep the default on other drivers, log the selected batch once, and include
+query type/count in failures so the next phone profile identifies the allocation.
+
+Generated-by: LLM
+
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3567,6 +3567,7 @@
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     VkQueryPoolCreateInfo pool_info;
+     VkResult vr;
++    static LONG kk_occlusion_logged;
+ 
+     TRACE("device %p, type_index %u, pool %p.\n", device, type_index, pool);
+ 
+@@ -3581,7 +3582,17 @@
+             /* Expect a large number of occlusion queries
+              * to be used within a single command list */
+             pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
+-            pool_info.queryCount = 4096;
++            /* KosmicKrisp reserves slots from one fixed visibility table when a pool is
++             * created. Large mostly-empty batches exhaust that table across allocators.
++             * The allocator already opens another pool when query_count is reached. */
++            if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP)
++            {
++                pool_info.queryCount = 256;
++                if (!InterlockedCompareExchange(&kk_occlusion_logged, 1, 0))
++                    INFO("NutsEmu: using 256-query occlusion pools on KosmicKrisp.\n");
++            }
++            else
++                pool_info.queryCount = 4096;
+             break;
+ 
+         case VKD3D_QUERY_TYPE_INDEX_PIPELINE_STATISTICS:
+@@ -3633,7 +3644,8 @@
+ 
+     if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &pool->vk_query_pool))) < 0)
+     {
+-        ERR("Failed to create query pool, vr %d.\n", vr);
++        ERR("Failed to create query pool, type %u, count %u, vr %d.\n",
++                type_index, pool_info.queryCount, vr);
+         return hresult_from_vk_result(vr);
+     }
+ 

@@ -3,6 +3,7 @@
 // to the already-running wineserver thread.
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <os/log.h>
 #import <pthread.h>
 #import "WineProcessBridge.h"
@@ -3026,4 +3027,20 @@ void madeira_memory_canary(const char *tmpdir) {
         mc_sample("throughput", "after", NULL);
     }
     fprintf(stderr, "[mem-canary] ml1076 done\n");
+}
+
+int wine_host_open_url(const char *url) {
+    if (!url) return 0;
+    if (strncmp(url, "http://", 7) != 0 &&
+        strncmp(url, "https://", 8) != 0 &&
+        strncmp(url, "mailto:", 7) != 0) {
+        return 0;
+    }
+    NSString *str = [NSString stringWithUTF8String:url];
+    NSURL *nsurl = str ? [NSURL URLWithString:str] : nil;
+    if (!nsurl) return 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:nsurl options:@{} completionHandler:nil];
+    });
+    return 1;
 }

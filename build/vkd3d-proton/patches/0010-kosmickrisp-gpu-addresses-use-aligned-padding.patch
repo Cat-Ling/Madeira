@@ -1,0 +1,25 @@
+vkd3d: use existing GPU address realignment on KosmicKrisp
+
+ReSkate logs a 64 KiB alignment request backed by a 16 KiB-aligned Metal GPU
+address. The existing padded allocation path handles this for Turnip but
+assumes other drivers satisfy 64 KiB alignment. Classify KosmicKrisp correctly.
+Only allocations requesting aligned observable GPU addresses use padding; the
+existing host-pointer, external-memory, scratch and feature exclusions remain.
+
+Generated-by: LLM
+
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1309,10 +1309,8 @@
+ 
+ static bool d3d12_device_aligns_bda_64k(struct d3d12_device *device)
+ {
+-    /* Only seems to affect Turnip for now at least.
+-     * TODO: We really should just have an extension for this.
+-     */
+-    return device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MESA_TURNIP;
++    return device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MESA_TURNIP &&
++            device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MESA_KOSMICKRISP;
+ }
+ 
+ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,

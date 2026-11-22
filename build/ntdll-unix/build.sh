@@ -267,17 +267,56 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             # (ios_default_keyed_event, loader_ios.c), not to the first process's
             # global. The copy is compiled from obj/, so its one relative include
             # is made absolute; the build fails if the source no longer matches.
+            # NutsEmu 0122/0162: preserve thread priority via thread_switch on
+            # Darwin instead of sched_yield (swtch_pri(0)), plus 2 ms spin backoff.
             perl -0pe 's/(NTSTATUS WINAPI NtWaitForKeyedEvent\()/HANDLE ios_default_keyed_event(void);\n$1/;
                        s/if \(!handle\) handle = keyed_event;/if (!handle) handle = ios_default_keyed_event();/g;
-                       s{"\.\./\.\./\.\./\.\./build/madeira_cfg\.h"}{"'"$REPO_ROOT"'/build/madeira_cfg.h"}' \
+                       s{"\.\./\.\./\.\./\.\./build/madeira_cfg\.h"}{"'"$REPO_ROOT"'/build/madeira_cfg.h"};
+                       s{(# include <mach/mach_time\.h>)}{$1\n# include <mach/mach_traps.h>\n# include <mach/thread_switch.h>}s;
+                       unless (/ios_yield_streak/) {
+                           s{(NTSTATUS WINAPI NtYieldExecution\(void\)\n\{)}{$1\n#ifdef __APPLE__\n    {\n        static __thread UINT64 last, streak_start;\n        UINT64 now = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );\n        if (now - last < 100000)\n        {\n            if (now - streak_start >= 2000000)\n            {\n                struct timespec ts = { 0, 50000 };\n                nanosleep( &ts, NULL );\n                last = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );\n                return STATUS_SUCCESS;\n            }\n        }\n        else streak_start = now;\n        last = now;\n    }\n#endif};
+                       }
+                       s{^([ \t]*)sched_yield\(\);$}{#ifdef __APPLE__\n$1thread_switch( MACH_PORT_NULL, SWITCH_OPTION_NONE, 0 );\n$1return STATUS_SUCCESS;\n#else\n$1sched_yield();\n#endif}m' \
                 "$src" > "$OBJ_DIR/sync_ios.c"
             if [ "$(grep -c 'handle = ios_default_keyed_event()' "$OBJ_DIR/sync_ios.c")" != 2 ]; then
                 echo "  sync: keyed-event patch did not apply"; exit 1
+            fi
+            if ! grep -q 'thread_switch( MACH_PORT_NULL, SWITCH_OPTION_NONE, 0 )' "$OBJ_DIR/sync_ios.c"; then
+                echo "  sync: thread_switch patch did not apply"; exit 1
             fi
             # MADEIRA_THREAD_QOS (thread_ios.c): ios_eco_apply_self sets a guest
             # thread's QoS through madeira_guest_qos_self, which picks the class
             # given for the thread's name; with the variable unset it passes through.
             compile_one "$OBJ_DIR/sync_ios.c" "sync" -Dpthread_set_qos_class_self_np=madeira_guest_qos_self
+            ;;
+        socket)
+            # NutsEmu 0151: Apple delivers received TOS as IP_RECVTOS (27),
+            # not IP_TOS; translate it to WS_IP_TOS for SteamNetworkingSockets.
+            perl -0pe 's{(                    case IP_TOS:\n)(\s*\{\n\s*INT tos =)}{$1#if defined(IP_RECVTOS) && IP_RECVTOS != IP_TOS\n                    case IP_RECVTOS:\n#endif\n$2}' \
+                "$src" > "$OBJ_DIR/socket_ios.c"
+            if ! grep -q 'case IP_RECVTOS:' "$OBJ_DIR/socket_ios.c"; then
+                echo "  socket: IP_RECVTOS patch did not apply"; exit 1
+            fi
+            compile_one "$OBJ_DIR/socket_ios.c" "socket"
+            ;;
+        file)
+            # NutsEmu 0148: per-write size/index/EOF queries use fstat alone
+            # without xattr listing (if not already handled by madeira_fd_stat_only).
+            perl -0pe 'unless (/madeira_fd_stat_only/) {
+                           my $pos = index($_, "NtQueryInformationFile(");
+                           die "NtQueryInformationFile not found\n" if $pos < 0;
+                           my $head = substr($_, 0, $pos);
+                           my $tail = substr($_, $pos);
+                           for my $cls (qw(FileStandardInformation FileInternalInformation FileEndOfFileInformation)) {
+                               $tail =~ s{(case \Q$cls\E:(?:(?!\n    case ).)*?)(if \()fd_get_file_info\( handle, fd, options, &st, &attr, NULL \)( == -1\)(?:(?!\n    case ).)*?fill_file_info\( &st, )attr(, )}{$1$2fstat( fd, &st )${3}0$4}s;
+                           }
+                           $_ = $head . $tail;
+                       }' \
+                "$src" > "$OBJ_DIR/file_ios.c"
+            if ! grep -Eq 'fstat\( fd, &st \)|madeira_fd_stat_only' "$OBJ_DIR/file_ios.c"; then
+                echo "  file: fstat fast-path patch did not apply"; exit 1
+            fi
+            compile_one "$OBJ_DIR/file_ios.c" "file"
             ;;
         *)
             compile_one "$src" "$name"

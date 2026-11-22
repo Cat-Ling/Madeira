@@ -1,0 +1,151 @@
+vkd3d: match unused color targets for colorless KosmicKrisp pipelines
+
+Metal validation caught an Invalid pipeline color format bound to an R8Unorm
+framebuffer in ReSkate. For colorless pipelines on KosmicKrisp without unused
+attachment support, track the bound color formats and reuse cached variants
+that match them, keeping color writes disabled. Preserve rendering attachments,
+clears, stores and resolves. Only colorless pipelines retain their shader code
+for these variants; ordinary color pipelines retain the existing memory use.
+Other drivers and drivers with the extension keep the existing path.
+
+Generated-by: LLM
+
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7561,6 +7561,25 @@
+     bool pso_invalidates_rp;
+     VkPipeline vk_pipeline;
+     uint32_t view_mask;
++
++    if (list->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP &&
++            !list->device->vk_info.EXT_dynamic_rendering_unused_attachments)
++    {
++        uint32_t count = list->rendering_info.info.colorAttachmentCount;
++        unsigned int i;
++        VkFormat format;
++
++        if (list->dynamic_state.rtv_count != count)
++            list->current_pipeline = VK_NULL_HANDLE;
++        list->dynamic_state.rtv_count = count;
++        for (i = 0; i < ARRAY_SIZE(list->dynamic_state.rtv_formats); i++)
++        {
++            format = i < count && list->rtvs[i].view ? list->rtvs[i].format->vk_format : VK_FORMAT_UNDEFINED;
++            if (list->dynamic_state.rtv_formats[i] != format)
++                list->current_pipeline = VK_NULL_HANDLE;
++            list->dynamic_state.rtv_formats[i] = format;
++        }
++    }
+ 
+     if (list->current_pipeline != VK_NULL_HANDLE)
+         return true;
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -6258,6 +6258,11 @@
+     if (graphics->multiview.dynamic_mask)
+         state->pso_is_fully_dynamic = false;
+ 
++    if (state->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP &&
++            !state->device->vk_info.EXT_dynamic_rendering_unused_attachments &&
++            !graphics->rtv_active_mask)
++        state->pso_is_fully_dynamic = false;
++
+     if (!state->pso_is_fully_dynamic)
+     {
+         /* If we got here successfully without SPIR-V code,
+@@ -6863,7 +6868,7 @@
+     *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
+             dynamic_state_buffer, key);
+ 
+-    if (!library_flags && graphics->library)
++    if (!library_flags && graphics->library && !(key && key->rtv_formats_override))
+     {
+         if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
+                 vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
+@@ -6898,6 +6903,17 @@
+ 
+     vkd3d_fragment_output_pipeline_desc_init(&fragment_output_desc, state, dsv_format,
+             key ? key->view_mask : 0, *dynamic_state_flags);
++    if (key && key->rtv_formats_override)
++    {
++        fragment_output_desc.rt_info.colorAttachmentCount = key->rtv_count;
++        fragment_output_desc.cb_info.attachmentCount = key->rtv_count;
++        for (i = 0; i < ARRAY_SIZE(key->rtv_formats); i++)
++        {
++            fragment_output_desc.rt_formats[i] = key->rtv_formats[i];
++            if (!(graphics->rtv_active_mask & (1u << i)))
++                memset(&fragment_output_desc.cb_attachments[i], 0, sizeof(fragment_output_desc.cb_attachments[i]));
++        }
++    }
+     vkd3d_fragment_output_pipeline_desc_prepare(&fragment_output_desc);
+ 
+     memset(&flags2, 0, sizeof(flags2));
+@@ -7115,6 +7131,25 @@
+     return vk_pipeline;
+ }
+ 
++static bool d3d12_pipeline_state_needs_rtv_variant(const struct d3d12_pipeline_state *state,
++        const struct vkd3d_dynamic_state *dyn_state)
++{
++    const struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    unsigned int i;
++
++    if (state->device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MESA_KOSMICKRISP ||
++            state->device->vk_info.EXT_dynamic_rendering_unused_attachments ||
++            graphics->rtv_active_mask)
++        return false;
++
++    if (graphics->rt_count != dyn_state->rtv_count)
++        return true;
++    for (i = 0; i < graphics->rt_count; i++)
++        if (graphics->rtv_formats[i] != dyn_state->rtv_formats[i])
++            return true;
++    return false;
++}
++
+ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
+         const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
+         uint32_t *dynamic_state_flags)
+@@ -7122,6 +7157,9 @@
+     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+ 
+     if (!graphics->pipeline)
++        return VK_NULL_HANDLE;
++
++    if (d3d12_pipeline_state_needs_rtv_variant(state, dyn_state))
+         return VK_NULL_HANDLE;
+ 
+     if (d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics) && dsv_format)
+@@ -7205,6 +7243,12 @@
+ 
+     pipeline_key.dsv_format = dsv_format ? dsv_format->vk_format : VK_FORMAT_UNDEFINED;
+     pipeline_key.view_mask = graphics->multiview.dynamic_mask ? dyn_state->view_mask : 0;
++    if (d3d12_pipeline_state_needs_rtv_variant(state, dyn_state))
++    {
++        pipeline_key.rtv_formats_override = true;
++        pipeline_key.rtv_count = dyn_state->rtv_count;
++        memcpy(pipeline_key.rtv_formats, dyn_state->rtv_formats, sizeof(pipeline_key.rtv_formats));
++    }
+ 
+     if (!(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))
+     {
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2533,6 +2533,9 @@
+     uint32_t view_mask;
+ 
+     bool dynamic_topology;
++    bool rtv_formats_override;
++    uint32_t rtv_count;
++    VkFormat rtv_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+ };
+ 
+ bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
+@@ -2891,6 +2894,8 @@
+     VkRect2D scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+     VkSampleCountFlagBits rasterization_samples;
+     uint32_t view_mask;
++    uint32_t rtv_count;
++    VkFormat rtv_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+ 
+     float blend_constants[4];
+ 
