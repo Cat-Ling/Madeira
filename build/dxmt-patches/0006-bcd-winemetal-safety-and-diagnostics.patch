@@ -2,15 +2,14 @@ Port Tier 3 winemetal safety, diagnostics, and opt-in placement-heap fixes from
 thebcd69/bcd-games:
   - Weak-import MTLSetShaderCachePath / MTLGetShaderCachePath in cache.c
   - Gate MADEIRA_FRAMEGEN on @available(iOS 26.0, macOS 26.0, *) at runtime
-  - Refuse impossible texture dimensions (>32768 or >2048 3D/array) before Metal SIGABRT
   - Log [gpu-error] diagnostics on failed Metal command buffers
   - Support opt-in madeira.cfg heap-untracked = 1 on D3D12 placement heaps
 
 diff --git a/src/winemetal/unix/cache.c b/src/winemetal/unix/cache.c
-index 02fc844..309d642 100644
+index 4bca217..7b044cb 100644
 --- a/src/winemetal/unix/cache.c
 +++ b/src/winemetal/unix/cache.c
-@@ -285,8 +285,12 @@ _CacheWriter_set(void *obj) {
+@@ -298,8 +298,12 @@ _CacheWriter_set(void *obj) {
  
  #ifndef DXMT_NO_PRIVATE_API
  
@@ -25,7 +24,7 @@ index 02fc844..309d642 100644
  
  int
  _WMTSetMetalShaderCachePath(void *obj) {
-@@ -302,6 +306,11 @@ _WMTSetMetalShaderCachePath(void *obj) {
+@@ -315,6 +319,11 @@ _WMTSetMetalShaderCachePath(void *obj) {
      return 0;
    }
  #endif
@@ -38,36 +37,10 @@ index 02fc844..309d642 100644
    params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
    [path release];
 diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
-index 8592f89..6961895 100644
+index 1f4c268..2fc5b98 100644
 --- a/src/winemetal/unix/winemetal_unix.c
 +++ b/src/winemetal/unix/winemetal_unix.c
-@@ -1197,6 +1197,25 @@ _MTLDevice_newTexture(void *obj) {
-   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
-   fill_texture_descriptor(desc, info);
- 
-+  /* madeira-bcd: mtl-tex-fail (thebcd69/bcd-games): Metal's descriptor validation
-+   * aborts the process (SIGABRT, not an exception) on a size beyond the device's limit; refuse the sizes no Apple GPU accepts. */
-+  if (desc.textureType != MTLTextureTypeTextureBuffer &&
-+      (desc.width > 32768 || desc.height > 32768 || desc.depth > 2048 || desc.arrayLength > 2048)) {
-+    static unsigned madeira_tex_refused;
-+    unsigned n = __atomic_add_fetch(&madeira_tex_refused, 1, __ATOMIC_RELAXED);
-+    if (n <= 8 || (n & (n - 1)) == 0)
-+      fprintf(stderr, "[mtl-tex-fail] madeira-bcd #%u: refused %lux%lux%lu (array %lu, mips %lu, format %lu, type %lu, usage 0x%lx): "
-+              "Metal aborts on a size above every Apple GPU's limit (32768; 3D depth and array length 2048)\n",
-+              n, (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.depth, (unsigned long)desc.arrayLength,
-+              (unsigned long)desc.mipmapLevelCount, (unsigned long)desc.pixelFormat, (unsigned long)desc.textureType,
-+              (unsigned long)desc.usage);
-+    params->ret = 0;
-+    info->gpu_resource_id = 0;
-+    info->mach_port = 0;
-+    [desc release];
-+    return STATUS_SUCCESS;
-+  }
-+
-   id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
-   params->ret = (obj_handle_t)ret;
-   info->gpu_resource_id = [ret gpuResourceID]._impl;
-@@ -3673,6 +3692,14 @@ static int madeira_fg_enabled(void) {
+@@ -3692,6 +3692,14 @@ static int madeira_fg_enabled(void) {
    if (g_fg_on < 0) {
      const char *e = getenv("MADEIRA_FRAMEGEN");
      g_fg_on = (e && *e && *e != '0') ? 1 : 0;
@@ -82,7 +55,7 @@ index 8592f89..6961895 100644
      if (g_fg_on)
        dprintf(STDERR_FILENO, "[framegen] ON (MADEIRA_FRAMEGEN): MetalFX frame interpolation between game frames\n");
    }
-@@ -5453,10 +5480,43 @@ thunk32_DXSOCompile(void *args) {
+@@ -5472,10 +5480,43 @@ thunk32_DXSOCompile(void *args) {
  
  #endif /* DXMT_NATIVE */
  
@@ -127,7 +100,7 @@ index 8592f89..6961895 100644
    return STATUS_SUCCESS;
  }
  
-@@ -7618,7 +7678,14 @@ _MTLDevice_newPlacementHeap(void *obj) {
+@@ -7637,7 +7678,14 @@ _MTLDevice_newPlacementHeap(void *obj) {
      hd.type = MTLHeapTypePlacement;
      hd.size = params->size;
      hd.storageMode = ((params->options & 0x30) == WMTResourceStorageModePrivate) ? MTLStorageModePrivate : MTLStorageModeShared;
