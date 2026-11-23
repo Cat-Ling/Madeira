@@ -8,6 +8,11 @@ Madeira's own code, and the combined application as distributed, are under
 **GPL-3.0-or-later** (`LICENSE`). Each upstream keeps its own license; the
 dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 
+Includes work from BCD by thebcd69 (https://github.com/thebcd69/bcd-games).
+Ported `BCD Material` tools (`tools/check-weak-libsystem.py`,
+`tools/check-ios-runtime-symbols.py`, `tools/dyld_cache_exports.py`) retain
+their headers under `LICENSE-BCD.md` (`app/Madeira/licenses/LICENSE-BCD.txt`).
+
 ## Components that ship in the built app
 
 | Component | Upstream license | **Madeira's fork** | Notes |

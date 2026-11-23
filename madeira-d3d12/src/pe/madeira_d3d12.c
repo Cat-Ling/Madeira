@@ -1465,7 +1465,9 @@ static void mad_untrack(struct mad_device *d, struct mad_resource *r);
 static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block);
 static UINT64 mad_res_row_bytes(const struct mad_resource *r);
 static int mad_map_texture_format(DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags, enum WMTPixelFormat *out, int *is_depth);
-static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);   /* ml1145 */
+static int mad_texinfo_from_desc(struct mad_device *d, const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);   /* ml1145 */
+static int mad_texinfo_over_limits(struct mad_device *d, const struct WMTTextureInfo *ti, UINT *edge);
+static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso);
 static void mad_alias_desc(const struct mad_resource *r, char *o, size_t cap);   /* madeira-bcd */
 static void mad_res_short(const struct mad_resource *r, char *o, size_t cap);
 struct mad_memheap;
@@ -1487,12 +1489,21 @@ static HRESULT mad_creation_failure(struct mad_device *d, const char *what) {
     return E_OUTOFMEMORY;
 }
 
+static int mad_iid_pageable(const IID *iid) {
+    return iid && (IsEqualGUID(iid, &IID_ID3D12Resource) || IsEqualGUID(iid, &IID_ID3D12Heap) ||
+                   IsEqualGUID(iid, &IID_ID3D12DescriptorHeap) || IsEqualGUID(iid, &IID_ID3D12QueryHeap) ||
+                   IsEqualGUID(iid, &IID_ID3D12Fence) || IsEqualGUID(iid, &IID_ID3D12PipelineState) ||
+                   IsEqualGUID(iid, &IID_ID3D12CommandAllocator) || IsEqualGUID(iid, &IID_ID3D12CommandSignature) ||
+                   IsEqualGUID(iid, &IID_ID3D12CommandQueue));
+}
+
 static HRESULT mad_qi(struct mad_obj *o, REFIID riid, void **out, int is_device_child) {
     if (!out) return E_POINTER;
     *out = NULL;
     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, o->iid) ||
         IsEqualGUID(riid, &IID_ID3D12Object) ||
-        (is_device_child && IsEqualGUID(riid, &IID_ID3D12DeviceChild))) {
+        (is_device_child && IsEqualGUID(riid, &IID_ID3D12DeviceChild)) ||
+        (is_device_child && IsEqualGUID(riid, &IID_ID3D12Pageable) && mad_iid_pageable(o->iid))) {
         InterlockedIncrement(&o->refs);
         *out = o;
         return S_OK;
@@ -1829,6 +1840,9 @@ static int mad_list_type_ok(D3D12_COMMAND_LIST_TYPE t) {
     return t == D3D12_COMMAND_LIST_TYPE_DIRECT || t == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
            t == D3D12_COMMAND_LIST_TYPE_COPY;
 }
+static int mad_list_or_bundle_type_ok(D3D12_COMMAND_LIST_TYPE t) {
+    return mad_list_type_ok(t) || t == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+}
 
 struct mad_alloc {
     ID3D12CommandAllocatorVtbl *vtbl;
@@ -1912,8 +1926,8 @@ struct mad_cmd {
         struct { struct mad_resource *dst, *src; UINT dlevel, dslice, slevel, sslice; UINT w, h, d; UINT dx, dy, dz, sx, sy, sz; UINT dplane, splane; } tt;
         struct { UINT x, y, z; } dispatch;
         struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; struct mad_resource *cnt; UINT64 cnt_off; } ind;
-        struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; obj_handle_t pattern; } fill;   /* ml1151: pattern = exact 32-bit source */
-        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
+        struct { struct mad_resource *res; UINT64 off, len; UINT8 byte, oneoff; obj_handle_t pattern; UINT32 per[4]; } fill;   /* ml1151: pattern = exact 32-bit source; madeira-bcd: oneoff = cache full, per = 16-byte period */
+        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; UINT32 per[4]; UINT8 oneoff; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
         struct { UINT bp, index, data, n; UINT64 va; } latch;   /* madeira-bcd static-cbv: bind point (0 graphics, 1 compute), parameter, descriptors in cdata */
@@ -9352,7 +9366,91 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
 }
 
+/* madeira-bcd (thebcd69/bcd-games): copy between uncompressed and block-compressed textures
+ * of matching block/texel size via staging buffer; opt-out with madeira.cfg t2t-reinterp = 0. */
+static int g_t2t_reinterp = -1;
+static int exec_copy_reinterpret(struct mad_exec *e, const struct mad_cmd *c) {
+    const struct mad_resource *s = c->u.tt.src, *d = c->u.tt.dst;
+    struct mad_device *dev = e->q->device;
+    UINT sbytes, sblock, dbytes, dblock, mw, mh, md, sw, sh, dw, dh, depth;
+    UINT64 row, img, need;
+    struct wmtcmd_blit_copy_from_texture_to_buffer k1; struct wmtcmd_blit_copy_from_buffer_to_texture k2;
+    static LONG said;
+    mad_format_info(s->desc.Format, &sbytes, &sblock);
+    mad_format_info(d->desc.Format, &dbytes, &dblock);
+    if (sblock == dblock || sbytes != dbytes || c->u.tt.splane || c->u.tt.dplane) return 0;
+    if (g_t2t_reinterp < 0) {
+        g_t2t_reinterp = mad_cfg_int_pe("t2t-reinterp", 1) && MTLDevice_supportsBCTextureCompression(dev->mtl_device) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] t2t-reinterp = %d: a copy between an uncompressed and a block-compressed texture %s\n",
+                  g_t2t_reinterp, g_t2t_reinterp ? "goes texel to block through a staging buffer"
+                                                 : "is a plain blit, as before (switched off, or the GPU stores BC uncompressed)");
+    }
+    if (!g_t2t_reinterp) return 0;
+    depth = c->u.tt.d ? c->u.tt.d : 1;
+    sw = c->u.tt.w; sh = c->u.tt.h;
+    if (sblock == 1) { row = (UINT64)sw * sbytes; img = row * sh; dw = sw * dblock; dh = sh * dblock; }
+    else { UINT bw = (sw + sblock - 1) / sblock, bh = (sh + sblock - 1) / sblock;
+           row = (UINT64)bw * sbytes; img = row * bh; dw = bw; dh = bh; }
+    mad_mip_dims(d, c->u.tt.dlevel, &mw, &mh, &md);
+    if (c->u.tt.dx >= mw || c->u.tt.dy >= mh) { MAD_SKIP(e); return 1; }
+    if (dw > mw - c->u.tt.dx) dw = mw - c->u.tt.dx;
+    if (dh > mh - c->u.tt.dy) dh = mh - c->u.tt.dy;
+    need = img * depth;
+    if (!need || !dw || !dh || row > 0xffffffffu || img > 0xffffffffu) { MAD_SKIP(e); return 1; }
+    EnterCriticalSection(&dev->heap_lock);
+    if (dev->ds_scratch_size < need) {
+        struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
+        if (dev->ds_scratch) NSObject_release(dev->ds_scratch);
+        memset(&bi, 0, sizeof bi); bi.length = sz; bi.options = WMTResourceStorageModePrivate;
+        dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
+        dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+    }
+    LeaveCriticalSection(&dev->heap_lock);
+    if (!dev->ds_scratch) { MAD_SKIP(e); return 1; }
+    if (InterlockedIncrement(&said) <= 16)
+        d3d12_log("[madeira-d3d12] t2t-reinterp r#%u (format %u, %ux%u) -> r#%u (format %u, %ux%u at %u,%u mip %u): %u bytes a %s\n",
+                  s->serial, (unsigned)s->desc.Format, sw, sh, d->serial, (unsigned)d->desc.Format, dw, dh,
+                  c->u.tt.dx, c->u.tt.dy, (unsigned)c->u.tt.dlevel, sbytes, sblock == 1 ? "texel to a block" : "block to a texel");
+    memset(&k1, 0, sizeof k1);
+    k1.type = WMTBlitCommandCopyFromTextureToBuffer;
+    k1.src = s->texture; k1.slice = c->u.tt.sslice; k1.level = c->u.tt.slevel;
+    k1.origin.x = c->u.tt.sx; k1.origin.y = c->u.tt.sy; k1.origin.z = c->u.tt.sz;
+    k1.size.width = sw; k1.size.height = sh; k1.size.depth = depth;
+    k1.dst = dev->ds_scratch; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k1);
+    exec_end(e);
+    if (!exec_begin_blit(e)) { MAD_SKIP(e); return 1; }
+    memset(&k2, 0, sizeof k2);
+    k2.type = WMTBlitCommandCopyFromBufferToTexture;
+    k2.src = dev->ds_scratch; k2.src_offset = 0; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
+    k2.size.width = dw; k2.size.height = dh; k2.size.depth = depth;
+    k2.dst = d->texture; k2.slice = c->u.tt.dslice; k2.level = c->u.tt.dlevel;
+    k2.origin.x = c->u.tt.dx; k2.origin.y = c->u.tt.dy; k2.origin.z = c->u.tt.dz;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
+    return 1;
+}
+
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
+/* madeira-bcd: one-off clear pattern buffer when the per-device 32-entry pattern cache is full. */
+static obj_handle_t exec_oneoff_pattern(struct mad_exec *e, const UINT32 per[4], UINT64 bytes) {
+    struct WMTBufferInfo bi; obj_handle_t b; UINT32 *w; UINT64 k, n;
+    static volatile LONG said, failed;
+    n = bytes < MAD_FILLPAT_BYTES ? (bytes + 15) & ~(UINT64)15 : MAD_FILLPAT_BYTES;
+    if (!n) n = 16;
+    memset(&bi, 0, sizeof bi); bi.length = n; bi.options = WMTResourceStorageModeShared;
+    b = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
+    if (!b || !bi.memory.ptr) {
+        if (b) NSObject_release(b);
+        if (InterlockedIncrement(&failed) <= 4) d3d12_log("[madeira-d3d12] one-off clear pattern of %llu bytes: Metal gave no buffer\n", (unsigned long long)n);
+        return 0;
+    }
+    w = (UINT32 *)bi.memory.ptr;
+    for (k = 0; k < n / 4; k++) w[k] = per[k & 3];
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] clear value %#x %#x %#x %#x: the pattern cache is full, copied from a one-off %llu-byte pattern\n",
+                  per[0], per[1], per[2], per[3], (unsigned long long)n);
+    return b;
+}
 /* ml1310: BC uploads on a GPU that cannot sample BC.
  *
  * winemetal creates every BC texture with an uncompressed format there
@@ -9455,17 +9553,20 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     switch (c->kind) {
     case MC_FILL_BB: {
         struct wmtcmd_blit_fillbuffer k;
+        obj_handle_t pat = c->u.fill.pattern, own = 0;
         if (!c->u.fill.res->buffer) { MAD_SKIP(e); return; }
-        if (c->u.fill.pattern) {   /* ml1151: a value whose bytes differ, copied from its pattern buffer */
+        if (!pat && c->u.fill.oneoff) pat = own = exec_oneoff_pattern(e, c->u.fill.per, c->u.fill.len);
+        if (pat) {   /* ml1151: a value whose bytes differ, copied from its pattern buffer */
             struct wmtcmd_blit_copy_from_buffer_to_buffer cp; UINT64 o;
             for (o = 0; o < c->u.fill.len; o += MAD_FILLPAT_BYTES) {
                 memset(&cp, 0, sizeof cp);
                 cp.type = WMTBlitCommandCopyFromBufferToBuffer;
-                cp.src = c->u.fill.pattern; cp.src_offset = 0;
+                cp.src = pat; cp.src_offset = 0;
                 cp.dst = c->u.fill.res->buffer; cp.dst_offset = c->u.fill.off + o;
                 cp.copy_length = c->u.fill.len - o < MAD_FILLPAT_BYTES ? c->u.fill.len - o : MAD_FILLPAT_BYTES;
                 MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&cp);
             }
+            if (own) NSObject_release(own);
             return;
         }
         memset(&k, 0, sizeof k);
@@ -9492,10 +9593,12 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         const struct mad_resource *r = c->u.filltex.res;
         struct wmtcmd_blit_copy_from_buffer_to_texture k;
         UINT w, h, d, row, band, s, z, y, nsl, is3d;
-        if (!r || !r->texture || !c->u.filltex.pattern) { MAD_SKIP(e); return; }
+        obj_handle_t pat = c->u.filltex.pattern, own = 0;
+        if (!r || !r->texture || (!pat && !c->u.filltex.oneoff)) { MAD_SKIP(e); return; }
         mad_mip_dims(r, c->u.filltex.level, &w, &h, &d);
         row = w * c->u.filltex.bpp;
         if (!row || row > MAD_FILLPAT_BYTES || c->u.filltex.level >= r->tex_mips) { MAD_SKIP(e); return; }
+        if (!pat && !(pat = own = exec_oneoff_pattern(e, c->u.filltex.per, MAD_FILLPAT_BYTES))) { MAD_SKIP(e); return; }
         band = MAD_FILLPAT_BYTES / row;
         is3d = r->tex_type == WMTTextureType3D;
         nsl = is3d ? 1 : r->tex_layers > c->u.filltex.sl0 ? r->tex_layers - c->u.filltex.sl0 : 0;
@@ -9506,13 +9609,14 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
                     UINT n = h - y < band ? h - y : band;
                     memset(&k, 0, sizeof k);
                     k.type = WMTBlitCommandCopyFromBufferToTexture;
-                    k.src = c->u.filltex.pattern; k.src_offset = 0;
+                    k.src = pat; k.src_offset = 0;
                     k.bytes_per_row = row; k.bytes_per_image = row * n;
                     k.size.width = w; k.size.height = n; k.size.depth = 1;
                     k.dst = r->texture; k.slice = is3d ? 0 : c->u.filltex.sl0 + s; k.level = c->u.filltex.level;
                     k.origin.x = 0; k.origin.y = y; k.origin.z = is3d ? z : 0;
                     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
                 }
+        if (own) NSObject_release(own);
         return;
     }
     case MC_COPY_BB: {
@@ -9568,6 +9672,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
             exec_copy_aspect(e, c);   /* a depth or stencil plane to or from a colour texture */
             return;
         }
+        if (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf && exec_copy_reinterpret(e, c)) return;
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToTexture;
         k.src = c->u.tt.src->texture; k.src_slice = c->u.tt.sslice; k.src_level = c->u.tt.slevel;
@@ -9810,7 +9915,7 @@ static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, 
     *out_off = off;
     return 1;
 }
-static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);
+static int mad_texinfo_from_desc(struct mad_device *d, const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);
 
 /* ResolveSubresource. Metal resolves as the store action of a render pass, so
  * this is a pass of its own with nothing drawn: load the multisampled source,
@@ -9866,7 +9971,7 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
             struct WMTTextureInfo ti; enum WMTPixelFormat pf; int is_depth = 0;
             td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
             td.SampleDesc.Count = 1; td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            if (mad_texinfo_from_desc(&td, &ti, &pf, &is_depth)) {
+            if (mad_texinfo_from_desc(e->q->device, &td, &ti, &pf, &is_depth)) {
                 ti.pixel_format = spf;   /* resolved in the source's format, copied as it */
                 dst->resolve_tmp = MTLDevice_newTexture(e->q->device->mtl_device, &ti);
                 dst->resolve_tmp_w = w; dst->resolve_tmp_h = h; dst->resolve_tmp_pf = (UINT)spf;
@@ -12102,7 +12207,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(ID3D12Device *Thi
         D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
     (void)This;
     if (!out) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_or_bundle_type_ok(type)) return E_NOTIMPL;
     struct mad_alloc *a = calloc(1, sizeof *a);
     if (!a) return E_OUTOFMEMORY;
     a->type = type;
@@ -12117,7 +12222,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
         ID3D12PipelineState *pso, REFIID riid, void **out) {
     (void)This; (void)node; (void)pso;
     if (!out || !allocator) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_or_bundle_type_ok(type)) return E_NOTIMPL;
     if (((struct mad_alloc *)allocator)->type != type) return E_INVALIDARG;
     struct mad_list *l = calloc(1, sizeof *l);
     if (!l) return E_OUTOFMEMORY;
@@ -12128,6 +12233,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
     ID3D12CommandAllocator_AddRef(allocator);
     InterlockedIncrement(&l->alloc->recording);   /* lists are created recording */
     l->recorded_generation = l->alloc->generation;
+    if (type == D3D12_COMMAND_LIST_TYPE_BUNDLE && pso) list_SetPipelineState((ID3D12GraphicsCommandList *)l, pso);
     HRESULT hr = list_QI((ID3D12GraphicsCommandList *)l, riid, out);
     list_Release((ID3D12GraphicsCommandList *)l);
     return hr;
@@ -12353,8 +12459,17 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
                         (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d->DepthOrArraySize ? d->DepthOrArraySize : 1));
             device_GetCopyableFootprints(This, d, 0, subs, 0, NULL, NULL, NULL, &bytes);
             if (d->SampleDesc.Count > 1) a = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
-            if (mad_texinfo_from_desc(d, &ti, &pf, &isd) && ((ti.width && ti.height) || !mad_zero_extent_guard()))   /* d3d12-zero-extent-guard: Metal aborts on a zero extent */
-                MTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
+            if (mad_texinfo_from_desc(md, d, &ti, &pf, &isd) && ((ti.width && ti.height) || !mad_zero_extent_guard())) {   /* d3d12-zero-extent-guard: Metal aborts on a zero extent */
+                UINT edge;
+                if (!mad_texinfo_over_limits(md, &ti, &edge))
+                    MTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
+                else {
+                    static LONG said_limits;
+                    if (InterlockedIncrement(&said_limits) <= 4)
+                        d3d12_log("[madeira-d3d12] GetResourceAllocationInfo: a texture of %ux%ux%u, array %u is beyond Metal's limits (%u per edge, 3D 2048, array 2048); no Metal size query\n",
+                                  (unsigned)ti.width, (unsigned)ti.height, (unsigned)ti.depth, (unsigned)ti.array_length, edge);
+                }
+            }
         }
         /* ml1145: a placed resource is really placed now, so the application must
          * plan its heap with the size and alignment Metal needs, not the linear
@@ -14971,7 +15086,7 @@ static void mad_placed_fallback(const struct mad_memheap *h, const D3D12_RESOURC
 /* ml1145: the Metal texture description a D3D12 resource gets. ONE builder for
  * creation and for GetResourceAllocationInfo, so the size the application
  * plans its heap with is the size the placement really takes. */
-static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth) {
+static int mad_texinfo_from_desc(struct mad_device *d, const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth) {
     UINT layers = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
     if (!mad_map_texture_format(desc->Format, desc->Flags, pf, is_depth)) return 0;
     memset(ti, 0, sizeof *ti);
@@ -15005,13 +15120,34 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
          * RG32Uint visibility buffers) are defined only with ShaderAtomic usage,
          * which Metal allows on exactly these three formats (with PixelFormatView). */
         if (ti->pixel_format == WMTPixelFormatR32Uint || ti->pixel_format == WMTPixelFormatR32Sint ||
-            ti->pixel_format == WMTPixelFormatRG32Uint)
+            (ti->pixel_format == WMTPixelFormatRG32Uint && mad_family_atomics64(d)))
             ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageShaderAtomic);
     }
     /* Views may reinterpret typeless and sRGB/linear pairs. */
     ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsagePixelFormatView);
     ti->options = WMTResourceStorageModePrivate;
     return 1;
+}
+#define MAD_MTL_FAMILY_APPLE10_FV 1010
+static UINT mad_metal_max_edge(struct mad_device *d) {
+    static volatile LONG edge;
+    LONG e = edge;
+    if (!e) {
+        e = MTLDevice_supportsFamily(d->mtl_device, MAD_MTL_FAMILY_APPLE10_FV) ? 32768 : 16384;
+        edge = e;
+    }
+    return (UINT)e;
+}
+static int mad_texinfo_over_limits(struct mad_device *d, const struct WMTTextureInfo *ti, UINT *edge) {
+    if (ti->type == WMTTextureType3D) {
+        *edge = 2048;
+        return ti->width > 2048 || ti->height > 2048 || ti->depth > 2048;
+    }
+    *edge = 16384;
+    if (ti->array_length > 2048) return 1;
+    if (ti->width <= 16384 && ti->height <= 16384) return 0;
+    *edge = mad_metal_max_edge(d);
+    return ti->width > *edge || ti->height > *edge;
 }
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
@@ -15042,11 +15178,20 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         struct WMTTextureInfo ti;
         enum WMTPixelFormat pf;
         int is_depth;
-        if (!mad_texinfo_from_desc(desc, &ti, &pf, &is_depth)) { free(r); mad_refuse_log(desc, heap_type, "texture format has no Metal mapping"); return E_NOTIMPL; }
+        if (!mad_texinfo_from_desc(d, desc, &ti, &pf, &is_depth)) { free(r); mad_refuse_log(desc, heap_type, "texture format has no Metal mapping"); return E_NOTIMPL; }
         /* d3d12-zero-extent-guard (mad_zero_extent_guard): a texture with a zero width or height aborts the whole
          * process in Metal's descriptor validation. Direct3D 12 refuses such a description with E_INVALIDARG; so does
          * this, with the game's own description in the log. */
         if ((!ti.width || !ti.height) && mad_zero_extent_guard()) { free(r); mad_refuse_log(desc, heap_type, "zero-size texture (Metal aborts the process on it)"); return E_INVALIDARG; }
+        {
+            UINT edge;
+            if (mad_texinfo_over_limits(d, &ti, &edge)) {
+                char why[160];
+                snprintf(why, sizeof why, "texture beyond Metal's limits: %ux%ux%u, array %u, limit %u per edge (3D 2048, array 2048); Metal aborts the process on it",
+                         (unsigned)ti.width, (unsigned)ti.height, (unsigned)ti.depth, (unsigned)ti.array_length, edge);
+                free(r); mad_refuse_log(desc, heap_type, why); return E_INVALIDARG;
+            }
+        }
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
@@ -15250,11 +15395,21 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(ID3D12Device *Th
  * resources the application aliases share memory as they do in D3D12 (see
  * struct mad_memheap above mad_create_resource). Other heap types keep the
  * description only; their placed resources allocate on their own. */
-static ID3D12HeapVtbl g_memheap_vtbl;
+static struct {
+    ID3D12HeapVtbl v;
+    HRESULT (STDMETHODCALLTYPE *GetProtectedResourceSession)(ID3D12Heap1 *This, REFIID riid, void **session);
+} g_memheap_vtbl1;
+#define g_memheap_vtbl (g_memheap_vtbl1.v)
+static HRESULT STDMETHODCALLTYPE memheap_GetProtectedResourceSession(ID3D12Heap1 *This, REFIID riid, void **session) {
+    (void)This; (void)riid;
+    if (session) *session = NULL;
+    madeira_d3d12_note_unimplemented("ID3D12Heap1", "GetProtectedResourceSession");
+    return E_NOTIMPL;
+}
 static HRESULT STDMETHODCALLTYPE memheap_QI(ID3D12Heap *This, REFIID riid, void **out) {
     struct mad_obj *o = (struct mad_obj *)This;
     if (!out) return E_POINTER;
-    if (IsEqualGUID(riid, &IID_ID3D12Pageable)) { InterlockedIncrement(&o->refs); *out = This; return S_OK; }
+    if (IsEqualGUID(riid, &IID_ID3D12Pageable) || IsEqualGUID(riid, &IID_ID3D12Heap1)) { InterlockedIncrement(&o->refs); *out = This; return S_OK; }
     return mad_qi(o, riid, out, 1);
 }
 static ULONG STDMETHODCALLTYPE memheap_AddRef(ID3D12Heap *This) { return mad_addref((struct mad_obj *)This); }
@@ -16876,6 +17031,22 @@ static void mad_sc_feed_blob(struct mad_sc_hash *h, UINT64 p, UINT64 n) {
 /* The key: every input field. Output pointers and capacities are left out on
  * purpose -- the sizing call and the real call carry different ones and must
  * find the same entry. */
+/* madeira-bcd (thebcd69/bcd-games): dxil-loop-guard = <hash>[,<hash>...] cache salt. */
+static int mad_loop_guard_listed(UINT64 p, UINT64 n) {
+    static char list[1024]; static int state = -1;
+    const unsigned char *b = (const unsigned char *)(uintptr_t)p; UINT64 hh = 0xcbf29ce484222325ull, i; char hex[17];
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) < 0) {
+        char raw[1024]; unsigned k;
+        raw[0] = 0; mad_cfg_str_pe("dxil-loop-guard", raw, sizeof raw);
+        for (k = 0; raw[k] && k < sizeof list - 1; k++) list[k] = (char)tolower((unsigned char)raw[k]);
+        list[k] = 0;
+        __atomic_store_n(&state, list[0] ? 1 : 0, __ATOMIC_RELEASE);
+    }
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) <= 0 || !b || !n) return 0;
+    for (i = 0; i < n; i++) { hh ^= b[i]; hh *= 0x100000001b3ull; }
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)hh);
+    return strstr(list, hex) != NULL;
+}
 static void mad_sc_key(const struct madeira_ir_convert_args *a, UINT64 key[2]) {
     struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
     const struct madeira_ir_input_layout *lay = (const struct madeira_ir_input_layout *)(uintptr_t)a->layout;
@@ -16904,6 +17075,7 @@ static void mad_sc_key(const struct madeira_ir_convert_args *a, UINT64 key[2]) {
     mad_sc_feed_u64(&h, ((UINT64)a->gs_stage << 32) | a->gs_strip);
     mad_sc_feed_blob(&h, a->gs_bytecode, a->gs_bytecode_len);
     mad_sc_feed_u64(&h, ((UINT64)(a->out_air_ranges != 0) << 1) | (a->out_air_ranges2 != 0));
+    if (mad_loop_guard_listed(a->dxil, a->dxil_len)) mad_sc_feed(&h, "dxil-loop-guard 65536", 21);
     key[0] = h.a; key[1] = h.b;
 }
 
@@ -19770,6 +19942,39 @@ static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *T
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_PSO);
     if (c) c->u.pso = (struct mad_pso *)pso;
 }
+/* madeira-bcd (thebcd69/bcd-games): D3D12 bundles copied inline at ExecuteBundle. */
+static void STDMETHODCALLTYPE list_ExecuteBundle(ID3D12GraphicsCommandList *This, ID3D12GraphicsCommandList *bundle) {
+    struct mad_list *l = (struct mad_list *)This, *b = (struct mad_list *)bundle;
+    static volatile LONG said, said_bad;
+    unsigned i, base, n0;
+    if (!l || l->closed) return;
+    if (!b || b->type != D3D12_COMMAND_LIST_TYPE_BUNDLE || !b->closed || l->type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        if (InterlockedIncrement(&said_bad) <= 8)
+            d3d12_log("[madeira-d3d12] ExecuteBundle refused: bundle %p type %d closed %d into a list of type %d\n", (void *)b,
+                      b ? (int)b->type : -1, b ? b->closed : -1, (int)l->type);
+        return;
+    }
+    if (b->ncdata && !mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + b->ncdata, sizeof *l->cdata)) return;
+    base = l->ncdata;
+    if (b->ncdata) memcpy(&l->cdata[base], b->cdata, (size_t)b->ncdata * sizeof *l->cdata);
+    l->ncdata += b->ncdata;
+    n0 = l->ncmds;
+    for (i = 0; i < b->ncmds; i++) {
+        struct mad_cmd *c = mad_list_push(l, b->cmds[i].kind);
+        if (!c) { l->ncmds = n0; return; }
+        *c = b->cmds[i];
+        switch (c->kind) {
+        case MC_ROOT_CONST: case MC_CROOT_CONST: c->u.rconst.data += base; break;
+        case MC_CBV_LATCH: c->u.latch.data += base; break;
+        case MC_CLEAR_RT: case MC_CLEAR_DS: if (c->u.clear.nrect) c->u.clear.rect_at += base; break;
+        default: break;
+        }
+    }
+    for (i = 0; i < b->nused; i++) mad_list_note_used(l, b->used[i]);
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] ExecuteBundle: %u commands and %u constant words of bundle %p copied into list %p\n",
+                  b->ncmds, b->ncdata, (void *)b, (void *)l);
+}
 static void STDMETHODCALLTYPE list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_cmd *c = mad_list_push(l, MC_ROOTSIG);
@@ -19950,6 +20155,58 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
     }
     return nch * bits / 8;
 }
+static int mad_buf_clear_period(const unsigned char *px, UINT bpp, UINT32 per[4]) {
+    unsigned char b[16]; unsigned i;
+    if (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16) return 0;
+    for (i = 0; i < 16; i++) b[i] = px[i % bpp];
+    memcpy(per, b, 16);
+    return 1;
+}
+static int mad_buf_clear_uniform(const UINT32 per[4]) {
+    const unsigned char *b = (const unsigned char *)per; unsigned i;
+    for (i = 1; i < 16; i++) if (b[i] != b[0]) return 0;
+    return 1;
+}
+static int mad_buf_clear_typed(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, int fmt_is_int, UINT32 per[4], UINT *bpp_out) {
+    unsigned char px[16]; UINT32 plain[4]; UINT bpp;
+    if (fmt == DXGI_FORMAT_UNKNOWN || (is_float && fmt_is_int)) return 0;
+    bpp = mad_pack_clear(fmt, v, is_float, px);
+    if (!mad_buf_clear_period(px, bpp, per)) return 0;
+    plain[0] = plain[1] = plain[2] = plain[3] = v[0];
+    if (!memcmp(per, plain, 16)) return 0;
+    if (bpp_out) *bpp_out = bpp;
+    return 1;
+}
+static DXGI_FORMAT mad_typed_uav_format(struct mad_device *d, struct mad_resource *r, const struct mad_descriptor *e) {
+    DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN; unsigned k;
+    if (!d || !r || !e->texture_view_id || !(e->metadata >> 63)) return f;
+    EnterCriticalSection(&d->view_lock);
+    for (k = 0; k < r->ntview; k++)
+        if (r->tview[k].id == e->texture_view_id && r->tview[k].uav && r->gpu_address + r->tview[k].off == e->gpu_va) {
+            f = (DXGI_FORMAT)r->tview[k].fmt; break;
+        }
+    LeaveCriticalSection(&d->view_lock);
+    return f;
+}
+static int mad_record_typed_buf_clear(struct mad_list *l, struct mad_cmd *c, struct mad_resource *r, const struct mad_descriptor *e,
+                                      const UINT32 v[4], int is_float, const char *what) {
+    UINT32 per[4]; UINT bpp = 0; DXGI_FORMAT fmt;
+    static volatile LONG said;
+    if (!v) return 0;
+    fmt = mad_typed_uav_format(l->device, r, e);
+    if (!mad_buf_clear_typed(fmt, v, is_float, mad_format_is_int(fmt), per, &bpp)) return 0;
+    c->u.fill.byte = (UINT8)(per[0] & 0xff); c->u.fill.pattern = 0; c->u.fill.oneoff = 0;
+    if (!mad_buf_clear_uniform(per)) {
+        c->u.fill.pattern = mad_fill_pattern16(l->device, per);
+        if (!c->u.fill.pattern) { memcpy(c->u.fill.per, per, 16); c->u.fill.oneoff = 1; }
+    }
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] %s through a typed buffer view (format %u, %u-byte elements): values %#x %#x %#x %#x -> every element "
+                  "%08x %08x %08x %08x (16 bytes of the fill), resource '%s' %llu bytes, range +%llu len %llu\n",
+                  what, (unsigned)fmt, bpp, v[0], v[1], v[2], v[3], per[0], per[1], per[2], per[3], r->name ? r->name : "?",
+                  (unsigned long long)r->size, (unsigned long long)c->u.fill.off, (unsigned long long)c->u.fill.len);
+    return 1;
+}
 static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct mad_resource *res, const UINT32 v[4], int is_float, const char *what) {
     static unsigned said_miss, said_fmt, said_ok;
     struct mad_uavtex u; unsigned char px[16]; UINT bpp, rbytes = 0, rblock = 0; UINT32 pat, w[4], per[4];
@@ -19982,7 +20239,17 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
     }
     bpp = u.res->samples > 1 ? 0 : mad_pack_clear(u.fmt, v, is_float, px);
     if (bpp) mad_format_info(u.res->desc.Format, &rbytes, &rblock);
-    if (bpp && rblock == 1 && rbytes && rbytes != bpp) bpp = 0;   /* the view must cover whole texels */
+    if (bpp && rblock == 1 && rbytes && rbytes != bpp) {
+        static const unsigned char zero[16];
+        static unsigned said_zero;
+        if (!memcmp(px, zero, sizeof zero) && (rbytes == 1 || rbytes == 2 || rbytes == 4 || rbytes == 8 || rbytes == 16)) {
+            if (said_zero++ < 8)
+                d3d12_log("[madeira-d3d12] %s to zero through a %u-byte view (format %u) of texture '%s' (format %u, %u-byte texels): "
+                          "cleared in the texture's own texel size\n", what, bpp, (unsigned)u.fmt, u.res->name ? u.res->name : "?",
+                          (unsigned)u.res->desc.Format, rbytes);
+            bpp = rbytes;
+        } else bpp = 0;
+    }
     memcpy(w, px, 16);
     if (bpp == 1) pat = px[0] * 0x01010101u;
     else if (bpp == 2) { pat = (UINT32)px[0] | ((UINT32)px[1] << 8); pat |= pat << 16; }
@@ -19999,11 +20266,11 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
         return;
     }
     pattern = mad_fill_pattern16(l->device, per);
-    if (!pattern) return;
     c = mad_list_push(l, MC_FILL_TEX);
     if (!c) return;
     c->u.filltex.res = u.res; c->u.filltex.level = u.level; c->u.filltex.sl0 = u.sl0; c->u.filltex.nsl = u.nsl;
     c->u.filltex.bpp = bpp; c->u.filltex.pattern = pattern;
+    if (!pattern) { memcpy(c->u.filltex.per, per, 16); c->u.filltex.oneoff = 1; }
     if (said_ok++ < 8)
         d3d12_log("[madeira-d3d12] %s on texture '%s' %ux%u mip %u slices %u+%d, format %u -> texel %#x x%u bytes\n",
                   what, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, u.sl0,
@@ -20034,21 +20301,25 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
     c = mad_list_push(l, MC_FILL_BB);
     if (!c) return;
     c->u.fill.res = r; c->u.fill.off = off; c->u.fill.len = len;
+    if (mad_record_typed_buf_clear(l, c, r, e, v, is_float, what)) return;
     {
         UINT32 x = v ? v[0] : 0; UINT8 b = (UINT8)(x & 0xff);
         int exact = v && v[0] == v[1] && v[1] == v[2] && v[2] == v[3] &&
                     ((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b;
-        c->u.fill.byte = b; c->u.fill.pattern = 0;
+        c->u.fill.byte = b; c->u.fill.pattern = 0; c->u.fill.oneoff = 0;
         if (!(((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b))
         {
             static unsigned said_pat;
             c->u.fill.pattern = mad_fill_pattern(l->device, x);   /* ml1151 */
+            if (!c->u.fill.pattern) {
+                c->u.fill.per[0] = c->u.fill.per[1] = c->u.fill.per[2] = c->u.fill.per[3] = x; c->u.fill.oneoff = 1;
+            }
             if (c->u.fill.pattern && said_pat++ < 16)
                 d3d12_log("[madeira-d3d12] ml1151 %s value %#x exact: resource '%s' %llu bytes, range +%llu len %llu (gpu 0x%llx)\n",
                           what, x, r->name ? r->name : "?", (unsigned long long)r->size, (unsigned long long)off,
                           (unsigned long long)len, (unsigned long long)r->gpu_address);
         }
-        if (!exact && !c->u.fill.pattern && said_approx++ < 4)
+        if (!exact && !c->u.fill.pattern && !c->u.fill.oneoff && said_approx++ < 4)
             d3d12_log("[madeira-d3d12] %s with value %#x is approximated by byte %#x (no pattern buffer)\n", what, x, b);
     }
 }
@@ -20267,6 +20538,113 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
         else { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; }
     }
 }
+/* madeira-bcd indirect-expand (thebcd69/bcd-games): opt-in (madeira.cfg indirect-expand = 1)
+ * CPU-recorded expansion for multi-argument ExecuteIndirect signatures in UPLOAD heaps. */
+static int g_indirect_expand = -1;
+static unsigned mad_indirect_arg_size(const D3D12_INDIRECT_ARGUMENT_DESC *a) {
+    switch (a->Type) {
+    case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: return 16;
+    case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: return 20;
+    case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: return 12;
+    case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: return 16;
+    case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: return 16;
+    case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+        return a->Constant.Num32BitValuesToSet >= 1 && a->Constant.Num32BitValuesToSet <= 64 ? a->Constant.Num32BitValuesToSet * 4 : 0;
+    case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+    case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+    case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: return 8;
+    default: return 0;
+    }
+}
+static int mad_indirect_expand(ID3D12GraphicsCommandList *This, struct mad_cmdsig *cs, UINT max_count,
+                               ID3D12Resource *args, UINT64 args_off, ID3D12Resource *count_buf, UINT64 count_off,
+                               const char **why) {
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_resource *ar = (struct mad_resource *)args;
+    UINT stride = cs->desc.ByteStride, natural = 0, i, n, count = max_count, last = cs->desc.NumArgumentDescs - 1;
+    int compute = 0, draws = 0;
+    static unsigned said_count, said_cap;
+    if (g_indirect_expand < 0) g_indirect_expand = mad_cfg_int_pe("indirect-expand", 0) ? 1 : 0;
+    if (!g_indirect_expand) { *why = "indirect-expand is off"; return 0; }
+    for (i = 0; i < cs->desc.NumArgumentDescs; i++) {
+        unsigned sz = mad_indirect_arg_size(&cs->args[i]);
+        if (!sz) { *why = cs->args[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? "a root constant argument with 0 or more than 64 values"
+                                                                                     : "an argument type this build does not expand"; return 0; }
+        natural += sz;
+        if (cs->args[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) compute = 1;
+        if (cs->args[i].Type <= D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+            draws++;
+            if (i != last) { *why = "a draw or dispatch that is not the last argument"; return 0; }
+        }
+    }
+    if (draws != 1) { *why = "not exactly one draw or dispatch per record"; return 0; }
+    if (!stride) stride = natural;
+    if (stride < natural) { *why = "a stride shorter than its arguments"; return 0; }
+    if (!ar || !ar->cpu || ar->heap != D3D12_HEAP_TYPE_UPLOAD) { *why = "an argument buffer that is not an UPLOAD heap"; return 0; }
+    if (count > 8192) {
+        if (said_cap++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect expansion: %u records capped at 8192\n", count);
+        count = 8192;
+    }
+    if (count_buf) {
+        struct mad_resource *cr = (struct mad_resource *)count_buf;
+        if (cr->cpu && cr->heap == D3D12_HEAP_TYPE_UPLOAD && count_off < cr->size && cr->size - count_off >= 4) {
+            UINT32 cnt;
+            memcpy(&cnt, (const unsigned char *)cr->cpu + count_off, 4);
+            if (cnt < count) count = cnt;
+        } else if (said_count++ < 1) {
+            d3d12_log("[madeira-d3d12] ExecuteIndirect expansion: the count buffer is not CPU-written; issuing all %u records\n", max_count);
+        }
+    }
+    if (args_off >= ar->size) count = 0;
+    else if ((ar->size - args_off) / stride < count) count = (UINT)((ar->size - args_off) / stride);
+    for (n = 0; n < count; n++) {
+        const unsigned char *p = (const unsigned char *)ar->cpu + args_off + (UINT64)n * stride;
+        for (i = 0; i < cs->desc.NumArgumentDescs; i++) {
+            const D3D12_INDIRECT_ARGUMENT_DESC *a = &cs->args[i];
+            switch (a->Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
+                UINT32 v[4]; memcpy(v, p, 16); p += 16;
+                if (v[0] && v[1]) list_DrawInstanced(This, v[0], v[1], v[2], v[3]);
+                break; }
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: {
+                UINT32 v[5]; memcpy(v, p, 20); p += 20;
+                if (v[0] && v[1]) list_DrawIndexedInstanced(This, v[0], v[1], v[2], (INT)v[3], v[4]);
+                break; }
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
+                UINT32 v[3]; memcpy(v, p, 12); p += 12;
+                if (v[0] && v[1] && v[2]) list_Dispatch(This, v[0], v[1], v[2]);
+                break; }
+            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+                D3D12_VERTEX_BUFFER_VIEW vb; memcpy(&vb, p, 16); p += 16;
+                list_IASetVertexBuffers(This, a->VertexBuffer.Slot, 1, &vb);
+                break; }
+            case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: {
+                D3D12_INDEX_BUFFER_VIEW ib; memcpy(&ib, p, 16); p += 16;
+                list_IASetIndexBuffer(This, &ib);
+                break; }
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+                UINT cn = a->Constant.Num32BitValuesToSet;
+                if (compute) list_SetComputeRoot32BitConstants(This, a->Constant.RootParameterIndex, cn, p, a->Constant.DestOffsetIn32BitValues);
+                else list_SetGraphicsRoot32BitConstants(This, a->Constant.RootParameterIndex, cn, p, a->Constant.DestOffsetIn32BitValues);
+                p += cn * 4;
+                break; }
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
+                UINT64 va; UINT index;
+                memcpy(&va, p, 8); p += 8;
+                index = a->Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW ? a->ConstantBufferView.RootParameterIndex
+                      : a->Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW ? a->ShaderResourceView.RootParameterIndex
+                      : a->UnorderedAccessView.RootParameterIndex;
+                if (compute) mad_record_croot(l, index, va, 1);
+                else mad_record_root(l, index, va, 1);
+                break; }
+            default: break;
+            }
+        }
+    }
+    return 1;
+}
 /* ml889: ExecuteIndirect. D3D12's argument records are byte-for-byte Metal's
  * indirect argument structs (DRAW_ARGUMENTS == MTLDrawPrimitivesIndirectArguments,
  * DRAW_INDEXED_ARGUMENTS == MTLDrawIndexedPrimitivesIndirectArguments,
@@ -20280,10 +20658,17 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(ID3D12GraphicsCommandList *Th
     struct mad_cmdsig *cs = (struct mad_cmdsig *)sig;
     struct mad_cmd *c;
     enum mad_ck kind;
-    static unsigned said_multi, said_count, said_big;
+    static unsigned said_multi, said_count, said_big, said_expand;
     if (!cs || !args || !max_count) return;
     if (cs->desc.NumArgumentDescs != 1) {
-        if (said_multi++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: signature with %u argument descs is not implemented; skipped\n", cs->desc.NumArgumentDescs);
+        const char *why = "";
+        if (mad_indirect_expand(This, cs, max_count, args, args_off, count_buf, count_off, &why)) {
+            if (said_expand++ < 2)
+                d3d12_log("[madeira-d3d12] ExecuteIndirect: a %u-argument signature (stride %u, %u records at most) is recorded as plain draws from its CPU-written records (madeira-bcd indirect-expand)\n",
+                          cs->desc.NumArgumentDescs, cs->desc.ByteStride, max_count);
+            return;
+        }
+        if (said_multi++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: signature with %u argument descs is not implemented (%s); skipped\n", cs->desc.NumArgumentDescs, why);
         return;
     }
     switch (cs->args[0].Type) {
@@ -20400,6 +20785,18 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
             c->u.bt.w = box->right - box->left; c->u.bt.h = box->bottom - box->top; c->u.bt.d = box->back - box->front;
         }
         c->u.bt.x = x; c->u.bt.y = y; c->u.bt.z = z;
+        /* Clip block-compressed copy extents from GetCopyableFootprints to the destination mip. */
+        if (block > 1) {
+            UINT rw = x < w ? w - x : 0, rh = y < h ? h - y : 0;
+            if ((rw && c->u.bt.w > rw) || (rh && c->u.bt.h > rh)) {
+                static LONG said_clip;
+                if (InterlockedIncrement(&said_clip) <= 4)
+                    d3d12_log("[madeira-d3d12] block-compressed copy of %ux%u at %u,%u into mip %u (%ux%u) of '%s' clipped to the mip\n",
+                              c->u.bt.w, c->u.bt.h, x, y, (unsigned)c->u.bt.level, w, h, d->name ? d->name : "?");
+                if (rw && c->u.bt.w > rw) c->u.bt.w = rw;
+                if (rh && c->u.bt.h > rh) c->u.bt.h = rh;
+            }
+        }
         return;
     }
     if (s->texture && !d->texture) {           /* readback: texture -> buffer */
@@ -20860,7 +21257,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList1(ID3D12Device10 *This,
     (void)node;
     if (!out) return E_INVALIDARG;
     if (flags != D3D12_COMMAND_LIST_FLAG_NONE) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_or_bundle_type_ok(type)) return E_NOTIMPL;
     struct mad_list *l = calloc(1, sizeof *l);
     if (!l) return E_OUTOFMEMORY;
     l->type = type;
@@ -21200,6 +21597,7 @@ static void build_vtables(void) {
     g_device_vtbl.CreateHeap = (void *)device_CreateHeap;
     g_device_vtbl.CreatePlacedResource = (void *)device_CreatePlacedResource;
     g_memheap_vtbl.QueryInterface          = memheap_QI;
+    g_memheap_vtbl1.GetProtectedResourceSession = memheap_GetProtectedResourceSession;
     g_memheap_vtbl.AddRef                  = memheap_AddRef;
     g_memheap_vtbl.Release                 = memheap_Release;
     g_memheap_vtbl.GetPrivateData          = memheap_GetPrivateData;
@@ -21317,6 +21715,7 @@ static void build_vtables(void) {
     g_list_vtbl.OMSetRenderTargets      = (void *)list_OMSetRenderTargets;
     g_list_vtbl.ClearRenderTargetView   = (void *)list_ClearRenderTargetView;
     g_list_vtbl.SetPipelineState        = (void *)list_SetPipelineState;
+    g_list_vtbl.ExecuteBundle           = (void *)list_ExecuteBundle;
     g_list_vtbl.SetGraphicsRootSignature= (void *)list_SetGraphicsRootSignature;
     g_list_vtbl.SetGraphicsRootConstantBufferView = (void *)list_SetGraphicsRootConstantBufferView;
     g_list_vtbl.SetGraphicsRootDescriptorTable = (void *)list_SetGraphicsRootDescriptorTable;

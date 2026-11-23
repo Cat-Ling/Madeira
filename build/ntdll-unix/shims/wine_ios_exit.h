@@ -26,3 +26,9 @@ static inline __attribute__((noreturn)) void wine_ios_exit(int status) {
 
 #define exit(x) wine_ios_exit(x)
 #endif
+
+/* pipe2() is new in iOS 27's libc: building with the iOS 27 SDK defines
+ * HAVE_PIPE2 and emits a weak _pipe2 import that resolves to NULL on
+ * iOS 26 and earlier, crashing game launches in server_pipe. Fall back
+ * to pipe() + FD_CLOEXEC. */
+#undef HAVE_PIPE2

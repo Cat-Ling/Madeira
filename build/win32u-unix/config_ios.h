@@ -18,5 +18,7 @@
 #undef SONAME_LIBEGL
 #undef SONAME_LIBVULKAN
 #undef SONAME_LIBGNUTLS
+/* pipe2() is iOS 27+; undefining avoids a weak _pipe2 NULL jump on iOS <= 26. */
+#undef HAVE_PIPE2
 
 #endif

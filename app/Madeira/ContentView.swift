@@ -3916,6 +3916,9 @@ struct SetupGuideView: View {
                     Text("Madeira is a proof-of-concept for running x86 Windows games on iOS using FEX-Emu, Wine, and Metal-based graphics translation.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                    Text("Includes work from BCD by thebcd69 (https://github.com/thebcd69/bcd-games)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
             .navigationTitle("Setup Guide")

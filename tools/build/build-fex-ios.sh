@@ -30,7 +30,9 @@ fi
 # on iOS (xtajit.dll, xtajit64.dll), which calls Win32 APIs and symbols that
 # only those modules define. The native library the app links uses __APPLE__.
 
-bash "$ROOT/build/fex-patches/apply.sh"
+if [[ -f "$SRC/CMakeLists.txt" ]]; then
+  bash "$ROOT/build/fex-patches/apply.sh"
+fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_SYSTEM_NAME=iOS \

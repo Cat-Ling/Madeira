@@ -45,6 +45,9 @@ xcodebuild \
 
 python3 "$ROOT/tools/build/runtime-components.py" bundle "$APP"
 
+python3 "$ROOT/tools/check-weak-libsystem.py" "$APP"
+python3 "$ROOT/tools/check-ios-runtime-symbols.py" "$APP" --auto
+
 # Preserve Madeira's requested JIT/debug entitlements in the IPA. SideStore will
 # replace this ad-hoc signature with the user's development signature while
 # retaining the supported entitlements.

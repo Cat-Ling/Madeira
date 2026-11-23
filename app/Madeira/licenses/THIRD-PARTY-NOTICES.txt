@@ -4,6 +4,11 @@ Madeira itself: GPL-3.0-or-later (LICENSE-MADEIRA-GPL-3.0.txt) with the
 Madeira Converter Exception, version 1 (LICENSE-MADEIRA-EXCEPTION.txt),
 which is a DRAFT and not in effect until adopted in a tagged release.
 
+Includes work from BCD by thebcd69 (https://github.com/thebcd69/bcd-games),
+with BCD Material licensed under GPL-3.0-only with LICENSE-BCD.txt (see
+tools/check-weak-libsystem.py, tools/check-ios-runtime-symbols.py, and
+tools/dyld_cache_exports.py in the repository).
+
 Steam sign-in, owned library and downloads (SwiftSteam): derived from
 Jfishin's Madeira Steam client and used with his permission; GPL-3.0-or-later
 with the exception, (C) 2026 Jfishin, 125hz.
