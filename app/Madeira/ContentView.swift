@@ -1481,7 +1481,7 @@ struct ContentView: View {
                         .background(.regularMaterial, in: Capsule())
                 }
                 .buttonStyle(.plain)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topCenter)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .padding(.top, 12)
             }
         }
