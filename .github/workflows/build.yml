@@ -219,6 +219,7 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         component: [dock, windows, moltenvk, zink, mesa-d3d12, vulkan-pe, kosmickrisp]
     env:
