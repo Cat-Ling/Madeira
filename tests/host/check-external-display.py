@@ -109,7 +109,7 @@ check("MadeiraApp starts ExternalDisplay.shared", "ExternalDisplay.shared.start(
 check("ContentView mounts game layer and Companion Deck", ".mountGameLayer(" in content and "ExternalPhoneCompanionView()" in content)
 check("Library.swift isolates gamepad input when TV Console owns input", "!ExternalDisplay.shared.consoleOwnsInput" in library and "ExternalLibraryBanner()" in library)
 check("HardwareInput.swift routes keyboard/mouse to TV Console", "ExternalConsoleController.shared.handleKey" in hw and "ExternalConsoleController.shared.moveCursor" in hw and "consoleInputActive" in hw)
-check("FPSOverlay.swift honors active external display refresh rate", "ExternalDisplay.shared.activeDisplayMaxFPS" in fps)
+check("FPSOverlay.swift honors active external display refresh rate", "ExternalDisplay.currentActiveMaxFPS" in fps)
 check("GuestDisplay.swift applies externalResolutionOverride", "externalResolutionOverride" in guest_src)
 
 print("PASS: ExternalDisplay Console & Companion wiring" if ok else "FAILED: ExternalDisplay Console & Companion checks")

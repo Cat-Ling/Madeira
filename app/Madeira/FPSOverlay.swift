@@ -29,7 +29,7 @@ final class ProMotionIntent {
     private var activeMax: Float = 0
 
     /// Honest report of what the panel can do, for the native `[frame]` line.
-    static var panelMaxFPS: Int { ExternalDisplay.shared.activeDisplayMaxFPS ?? UIScreen.main.maximumFramesPerSecond }
+    static var panelMaxFPS: Int { ExternalDisplay.currentActiveMaxFPS ?? UIScreen.main.maximumFramesPerSecond }
 
     /// The opt-in above; read when a session's pacing is applied.
     static var holdMaximum: Bool { MadeiraConfig.flag("MADEIRA_PROMOTE", fallback: false) }

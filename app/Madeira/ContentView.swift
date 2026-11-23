@@ -1470,7 +1470,7 @@ struct ContentView: View {
                 }
             if external.companionOwnsPhoneTouches {
                 ExternalPhoneCompanionView()
-            } else if external.isActive && !MetalBackedView.desktopMode {
+            } else if external.isActive && !HardwareInput.desktopMode {
                 Button {
                     external.phoneMode = .companion
                 } label: {

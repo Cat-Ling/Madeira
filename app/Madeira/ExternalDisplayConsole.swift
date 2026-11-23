@@ -229,6 +229,34 @@ final class ExternalDisplay: ObservableObject {
             || UIScreen.screens.contains { $0.mirrored != nil }
     }
 
+    private struct ThreadSafeState {
+        var active: Bool = false
+        var matchRefreshRate: Bool = true
+        var screenMaxFPS: Int = 60
+        var sessionRunning: Bool = false
+        var preset: ExternalResolutionPreset = .auto
+        var nativeSize: CGSize = .zero
+    }
+    private nonisolated static let stateLock = NSLock()
+    private nonisolated(unsafe) static var sharedState = ThreadSafeState()
+
+    nonisolated static var currentActiveMaxFPS: Int? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard sharedState.active, sharedState.matchRefreshRate, sharedState.sessionRunning else { return nil }
+        return max(sharedState.screenMaxFPS, 1)
+    }
+
+    nonisolated static func resolveExternalLaunchResolution(gameResolution: String?) -> String? {
+        stateLock.lock()
+        let snap = sharedState
+        stateLock.unlock()
+        guard snap.active else { return nil }
+        let isDesktop = getenv("MADEIRA_DESKTOP").map { String(cString: $0) == "1" } ?? false
+        guard !isDesktop else { return nil }
+        return snap.preset.resolve(externalPixels: snap.nativeSize, gameResolution: gameResolution ?? "1280x720")
+    }
+
     private enum Keys {
         static let enabled = "madeiraExternalDisplayEnabled"
         static let resPreset = "madeiraExtResPreset"
@@ -259,7 +287,10 @@ final class ExternalDisplay: ObservableObject {
         }
     }
     @Published var resolutionPreset: ExternalResolutionPreset {
-        didSet { UserDefaults.standard.set(resolutionPreset.rawValue, forKey: Keys.resPreset) }
+        didSet {
+            UserDefaults.standard.set(resolutionPreset.rawValue, forKey: Keys.resPreset)
+            publishThreadSafeState()
+        }
     }
     @Published var aspectOverride: ExternalAspectRatio {
         didSet {
@@ -284,6 +315,7 @@ final class ExternalDisplay: ObservableObject {
     @Published var matchRefreshRate: Bool {
         didSet {
             UserDefaults.standard.set(matchRefreshRate, forKey: Keys.matchRefresh)
+            publishThreadSafeState()
             if LibraryModel.shared.current != nil {
                 let mode = ProMotionIntent.supportedMode(LibraryModel.shared.fpsMode)
                 ProMotionIntent.apply(mode: mode)
@@ -335,7 +367,21 @@ final class ExternalDisplay: ObservableObject {
 
     /// True when phone touches belong to ExternalPhoneCompanionView rather than TouchControls or MetalBackedView.
     var companionOwnsPhoneTouches: Bool {
-        isActive && LibraryModel.shared.current != nil && !MetalBackedView.desktopMode && phoneMode == .companion
+        isActive && LibraryModel.shared.current != nil && !HardwareInput.desktopMode && phoneMode == .companion
+    }
+
+    private func publishThreadSafeState() {
+        let sessionRunning = LibraryModel.shared.current != nil
+        Self.stateLock.lock()
+        Self.sharedState = ThreadSafeState(
+            active: isActive,
+            matchRefreshRate: matchRefreshRate,
+            screenMaxFPS: screenMaxFPS,
+            sessionRunning: sessionRunning,
+            preset: resolutionPreset,
+            nativeSize: screenNativeSize
+        )
+        Self.stateLock.unlock()
     }
 
     func start() {
@@ -352,16 +398,14 @@ final class ExternalDisplay: ObservableObject {
                 Task { @MainActor [weak self] in self?.update() }
             }
         }
-        GuestDisplay.externalResolutionOverride = { [weak self] gameResolution in
-            guard let self, self.isActive else { return nil }
-            let isDesktop = getenv("MADEIRA_DESKTOP").map { String(cString: $0) == "1" } ?? false
-            guard !isDesktop else { return nil }
-            return self.effectiveLaunchResolution(gameResolution: gameResolution ?? "1280x720")
+        GuestDisplay.externalResolutionOverride = { gameResolution in
+            ExternalDisplay.resolveExternalLaunchResolution(gameResolution: gameResolution)
         }
         sessionCancellable = LibraryModel.shared.$current.sink { [weak self] newValue in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if newValue == nil { self.phoneMode = .companion }
+                self.publishThreadSafeState()
                 self.syncPhoneControlMode()
                 self.syncControllerOwnership()
                 MetalBackedView.refreshDisplayMode(reason: "ext-session-change")
@@ -384,7 +428,11 @@ final class ExternalDisplay: ObservableObject {
     func previewOverscanGuides() {
         showOverscanGuides = true
         overscanGuideHideWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.showOverscanGuides = false }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.showOverscanGuides = false
+            }
+        }
         overscanGuideHideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
@@ -462,6 +510,7 @@ final class ExternalDisplay: ObservableObject {
             } else if !isActive {
                 isActive = true
             }
+            publishThreadSafeState()
             if LibraryModel.shared.current != nil && matchRefreshRate {
                 ProMotionIntent.apply(mode: ProMotionIntent.supportedMode(LibraryModel.shared.fpsMode))
             }
@@ -471,7 +520,11 @@ final class ExternalDisplay: ObservableObject {
             teardownWindow(reason: hasExtraScreen ? "disabled" : "disconnected")
             // AirPlay/wired UIScreen notifications sometimes arrive a moment before UIWindowScene connects (MeloNX pattern).
             if Self.enabled && userEnabled && hasExtraScreen && retryCount < 4 {
-                let work = DispatchWorkItem { [weak self] in self?.update(retryCount: retryCount + 1) }
+                let work = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated {
+                        self?.update(retryCount: retryCount + 1)
+                    }
+                }
                 retryWork = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
             }
@@ -481,6 +534,7 @@ final class ExternalDisplay: ObservableObject {
     private func teardownWindow(reason: String) {
         guard let old = window else {
             if isActive { isActive = false }
+            publishThreadSafeState()
             syncControllerOwnership()
             return
         }
@@ -488,6 +542,7 @@ final class ExternalDisplay: ObservableObject {
         window = nil
         gameHostContainer = nil
         hostingController = nil
+        publishThreadSafeState()
         MetalBackedView.refreshDisplayMode(reason: "external-\(reason)")
         if MetalHostView.shared.superview === old || MetalHostView.shared.window === old {
             MetalHostView.shared.removeFromSuperview()
@@ -631,7 +686,11 @@ final class ExternalConsoleController: ObservableObject {
     private func showCursorBriefly() {
         cursorVisible = true
         cursorHideWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.cursorVisible = false }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.cursorVisible = false
+            }
+        }
         cursorHideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work)
     }
@@ -1219,9 +1278,9 @@ private struct ExternalConsoleHomeView: View {
                     tint: .cyan
                 )
                 statusBadge(
-                    icon: jitState.jit ? "bolt.fill" : "bolt.slash",
-                    text: jitState.jit ? "JIT On" : "No JIT",
-                    tint: jitState.jit ? .green : .orange
+                    icon: jitState.enabled ? "bolt.fill" : "bolt.slash",
+                    text: jitState.enabled ? "JIT On" : "No JIT",
+                    tint: jitState.enabled ? .green : .orange
                 )
                 if !GCController.controllers().isEmpty {
                     Image(systemName: "gamecontroller.fill").foregroundStyle(.green)
@@ -1501,7 +1560,7 @@ private struct ExternalConsoleHomeView: View {
     private var settingsTab: some View {
         VStack(spacing: 12) {
             consoleSettingRow(index: 0, title: "Eco Mode (Efficiency Cores)", value: console.ecoEnabled ? "On" : "Off")
-            consoleSettingRow(index: 1, title: "JIT Status", value: jitState.jit ? "Enabled & Ready" : "Tap / Press A to Enable JIT")
+            consoleSettingRow(index: 1, title: "JIT Status", value: jitState.enabled ? "Enabled & Ready" : "Tap / Press A to Enable JIT")
             consoleSettingRow(index: 2, title: "Switch Back to Screen Mirroring", value: "Return output to phone display")
             Spacer()
         }

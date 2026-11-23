@@ -1055,7 +1055,9 @@ final class HardwareInput: ObservableObject {
     private func evaluateFocus(_ why: String) {
         installTouchObserver()
         let base = computeBaseFocus()
-        let extOwnsConsole = ExternalDisplay.shared.consoleOwnsInput
+        let (extOwnsConsole, tvGameplay) = MainActor.assumeIsolated {
+            (ExternalDisplay.shared.consoleOwnsInput, ExternalDisplay.shared.isGameplayOnExternal)
+        }
         motionLock.lock()
         consoleInputActive = extOwnsConsole
         motionLock.unlock()
@@ -1064,7 +1066,6 @@ final class HardwareInput: ObservableObject {
         // against a screen edge, while GCMouse deltas keep coming; following
         // hover there dropped mouse-look at every edge. Clicks decide instead.
         let over = hoverSeen && !Self.isPhone ? pointerOver : clickFocus.onGame
-        let tvGameplay = ExternalDisplay.shared.isGameplayOnExternal
         let mouse = base && !extOwnsConsole && (tvGameplay || !Self.focusEnabled || pointerLocked || over || !gameButtons.isEmpty)
         baseFocused = base
         updateButtonPolling(active: Self.mouseRoutingEnabled && appActive && mouseConnected)
@@ -1098,7 +1099,7 @@ final class HardwareInput: ObservableObject {
     private func computeBaseFocus() -> Bool {
         guard appActive, UIApplication.shared.applicationState == .active else { return false }
         if LibraryModel.shared.enabled && LibraryModel.shared.menu { return false }
-        if ExternalDisplay.shared.isGameplayOnExternal { return true }
+        if MainActor.assumeIsolated({ ExternalDisplay.shared.isGameplayOnExternal }) { return true }
         guard Self.focusEnabled else { return true }
         guard let v = MetalBackedView.keyboardTarget, let w = v.window,
               !v.isHidden, !w.isHidden, v.alpha > 0.01 else { return false }
@@ -1190,13 +1191,16 @@ final class HardwareInput: ObservableObject {
             if pressed { log("unmapped HID usage 0x\(String(code.rawValue, radix: 16))") }
             return
         }
-        if pressed && ExternalDisplay.shared.isGameplayOnExternal && vk == 0x79 {
-            _ = ExternalConsoleController.shared.handleKey(vk: vk)
+        let (tvGameplay, consoleOwns) = MainActor.assumeIsolated {
+            (ExternalDisplay.shared.isGameplayOnExternal, ExternalDisplay.shared.consoleOwnsInput)
+        }
+        if pressed && tvGameplay && vk == 0x79 {
+            MainActor.assumeIsolated { _ = ExternalConsoleController.shared.handleKey(vk: vk) }
             keys.focusLost(); syncKeys()
             return
         }
-        if ExternalDisplay.shared.consoleOwnsInput {
-            if pressed { _ = ExternalConsoleController.shared.handleKey(vk: vk) }
+        if consoleOwns {
+            if pressed { MainActor.assumeIsolated { _ = ExternalConsoleController.shared.handleKey(vk: vk) } }
             keys.focusLost(); syncKeys()
             return
         }
@@ -1482,7 +1486,9 @@ final class HardwareInput: ObservableObject {
         if consoleRouting {
             motionLock.unlock()
             DispatchQueue.main.async {
-                ExternalConsoleController.shared.moveCursor(dx: dx, dy: -dy)
+                MainActor.assumeIsolated {
+                    ExternalConsoleController.shared.moveCursor(dx: dx, dy: -dy)
+                }
             }
             return
         }
@@ -1627,8 +1633,10 @@ final class HardwareInput: ObservableObject {
     /// A press goes to the program only if it has the mouse's focus when the
     /// press happens; a release always follows its press. Main thread.
     private func buttonChanged(_ b: MouseButton, _ pressed: Bool, at t: CFTimeInterval) {
-        if ExternalDisplay.shared.consoleOwnsInput {
-            ExternalConsoleController.shared.handleMouseButton(b, pressed: pressed)
+        if MainActor.assumeIsolated({ ExternalDisplay.shared.consoleOwnsInput }) {
+            MainActor.assumeIsolated {
+                ExternalConsoleController.shared.handleMouseButton(b, pressed: pressed)
+            }
             return
         }
         gcButtonSeen = true
@@ -1700,7 +1708,9 @@ final class HardwareInput: ObservableObject {
         if consoleRouting {
             motionLock.unlock()
             DispatchQueue.main.async {
-                ExternalConsoleController.shared.handleMouseScroll(dx: x, dy: y)
+                MainActor.assumeIsolated {
+                    ExternalConsoleController.shared.handleMouseScroll(dx: x, dy: y)
+                }
             }
             return
         }
@@ -2040,6 +2050,7 @@ final class HardwareInput: ObservableObject {
 
     // MARK: - Accessories Over LAN (AoL) injection
 
+    @MainActor
     func injectRemoteKey(hidUsage: UInt16, pressed: Bool, heldUsages: Set<UInt16>) {
         tickKeys += 1
         let vk = HardwareKeyMap.vk(forHIDUsage: Int(hidUsage))
@@ -2070,6 +2081,7 @@ final class HardwareInput: ObservableObject {
         startTicker()
     }
 
+    @MainActor
     func injectRemoteMouse(dx: Int32, dy: Int32, wheelX: Int32, wheelY: Int32,
                            buttonMask: UInt8, updateButtons: Bool) {
         if ExternalDisplay.shared.consoleOwnsInput {
@@ -2116,6 +2128,7 @@ final class HardwareInput: ObservableObject {
         startTicker()
     }
 
+    @MainActor
     func releaseAllRemoteInput() {
         releaseRemoteKeys()
         let gameUps = remoteButtonsPosted.update([]).up

@@ -869,7 +869,9 @@ final class AccessoriesOverLAN: ObservableObject {
         let rumble = DispatchSource.makeTimerSource(queue: .main)
         rumble.schedule(deadline: .now() + .milliseconds(16), repeating: .milliseconds(16), leeway: .milliseconds(4))
         rumble.setEventHandler { [weak self] in
-            self?.pollRumble()
+            MainActor.assumeIsolated {
+                self?.pollRumble()
+            }
         }
         rumble.resume()
         rumbleTimer = rumble
@@ -878,14 +880,16 @@ final class AccessoriesOverLAN: ObservableObject {
         let dog = DispatchSource.makeTimerSource(queue: .main)
         dog.schedule(deadline: .now() + 1, repeating: 1)
         dog.setEventHandler { [weak self] in
-            guard let self, self.clientConnected else { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            if now - self.lastPacketAt > 4.0 {
-                LogStore.shared.log("[aol] client '\(self.clientHost)' timed out")
-                self.disconnectActiveClient(reason: 5, sendPacket: false)
-            } else if let conn = self.activeConnection {
-                let nowUS = UInt64(now * 1_000_000)
-                self.send(.ping(nowUS), on: conn)
+            MainActor.assumeIsolated {
+                guard let self, self.clientConnected else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                if now - self.lastPacketAt > 4.0 {
+                    LogStore.shared.log("[aol] client '\(self.clientHost)' timed out")
+                    self.disconnectActiveClient(reason: 5, sendPacket: false)
+                } else if let conn = self.activeConnection {
+                    let nowUS = UInt64(now * 1_000_000)
+                    self.send(.ping(nowUS), on: conn)
+                }
             }
         }
         dog.resume()
