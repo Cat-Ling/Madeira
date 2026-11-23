@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright 2026 thebcd69 (BCD)
 # BCD Material: additional terms under GPL-3.0 section 7 apply; see LICENSE-BCD.md.
+# Modified for Madeira on 2026-11-23.
 """Weak C imports from the system libraries in the built app (2026-11-20).
 
 A C function that is newer than the app's oldest iOS is imported weakly: on an older iOS it resolves to NULL, and C code that calls
@@ -21,6 +22,7 @@ from pathlib import Path
 
 KNOWN = {
     "__availability_version_check": "the compiler's own availability check (__builtin_available)",
+    "__dyld_get_dlopen_image_header": "iOS 18.0; the app needs iOS 18",
     "_os_sync_wait_on_address": "iOS 17.4; the app needs iOS 18",
     "_os_sync_wait_on_address_with_timeout": "iOS 17.4; the app needs iOS 18",
     "_os_sync_wake_by_address_all": "iOS 17.4; the app needs iOS 18",

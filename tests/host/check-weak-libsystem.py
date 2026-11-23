@@ -51,6 +51,7 @@ fixture = """/x/Madeira [arm64]:
       0x0601  _pipe2 [weak-import] (from libSystem)
       0x0602  __availability_version_check [weak-import] (from libSystem)
       0x0603  _os_sync_wake_by_address_any [weak-import] (from libSystem)
+      0x0608  __dyld_get_dlopen_image_header [weak-import] (from libSystem)
       0x0604  _$s10Foundation4DateV2geoiySbAC_ACtFZ [weak-import] (from Foundation)
       0x0605  _OBJC_CLASS_$_UIHingeInteraction [weak-import] (from UIKit)
       0x0606  _pipe (from libSystem)
@@ -64,6 +65,7 @@ check(
         "_pipe2",
         "__availability_version_check",
         "_os_sync_wake_by_address_any",
+        "__dyld_get_dlopen_image_header",
         "__ZNSt3__1newthing",
         "_pthread_mutexattr_init",
     ],
