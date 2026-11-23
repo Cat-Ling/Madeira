@@ -86,75 +86,6 @@ final class MetalHostView: UIView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-/// Manages a dedicated external window (AirPlay or HDMI/USB-C) for direct game
-/// sessions, leaving touch controls and menus on the device screen.
-@MainActor
-final class ExternalDisplay {
-    static let shared = ExternalDisplay()
-    static let enabled = MadeiraConfig.flag("MADEIRA_EXTERNAL_DISPLAY")
-
-    static var displayShared: Bool {
-        UIScreen.screens.count > 1
-            || UIScreen.main.isCaptured
-            || UIScreen.screens.contains { $0.mirrored != nil }
-    }
-
-    private(set) var window: UIWindow?
-    private var wanted = false
-    private var started = false
-
-    func setWanted(_ on: Bool) {
-        if !started {
-            started = true
-            let nc = NotificationCenter.default
-            for name in [UIScreen.didConnectNotification,
-                         UIScreen.didDisconnectNotification,
-                         UIScene.willConnectNotification,
-                         UIScene.didDisconnectNotification] {
-                nc.addObserver(forName: name, object: nil, queue: .main) { _ in
-                    DispatchQueue.main.async { ExternalDisplay.shared.update() }
-                }
-            }
-        }
-        guard on != wanted else { return }
-        wanted = on
-        update()
-    }
-
-    private func externalScene() -> UIWindowScene? {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first { $0.session.role == .windowExternalDisplayNonInteractive || $0.screen !== UIScreen.main }
-    }
-
-    func update() {
-        let scene = Self.enabled && wanted ? externalScene() : nil
-        if let scene {
-            if window?.windowScene !== scene {
-                let w = UIWindow(windowScene: scene)
-                w.backgroundColor = .black
-                let vc = UIViewController()
-                vc.view.backgroundColor = .black
-                w.rootViewController = vc
-                w.isHidden = false
-                window = w
-                let b = scene.coordinateSpace.bounds
-                let fps = scene.screen.maximumFramesPerSecond
-                fputs("[display] external display on: \(Int(b.width))x\(Int(b.height)) @\(fps)Hz\n", stderr)
-            }
-        } else if let old = window {
-            window = nil
-            MetalBackedView.refreshDisplayMode(reason: "external-display")
-            if MetalHostView.shared.superview === old {
-                MetalHostView.shared.removeFromSuperview()
-            }
-            old.isHidden = true
-            fputs("[display] external display off\n", stderr)
-        }
-        MetalBackedView.refreshDisplayMode(reason: "external-display")
-    }
-}
-
 /// Touches on the game view outside the on-screen controls reach the program as
 /// a mouse. Some games (Dark Souls Remastered) switch to keyboard and mouse
 /// prompts on any mouse event and then ignore the controller, so a stray tap
@@ -198,17 +129,6 @@ final class ExternalDisplay {
 final class MetalBackedView: UIView {
     private static var layerRegistered = false
 
-    private let externalLabel: UILabel = {
-        let label = UILabel()
-        label.text = "Playing on external display"
-        label.textColor = UIColor.white.withAlphaComponent(0.5)
-        label.font = .systemFont(ofSize: 15, weight: .medium)
-        label.textAlignment = .center
-        label.isUserInteractionEnabled = false
-        label.isHidden = true
-        return label
-    }()
-
     // Hardware keyboard bridge: the view becomes first responder so the iOS
     // software keyboard appears, and each typed character is forwarded to
     // Wine as a virtual-key sequence (winios_post_key → send_hardware_message
@@ -249,13 +169,11 @@ final class MetalBackedView: UIView {
         // carry indirect-pointer motion (HardwareInput.swift). No-op with
         // MADEIRA_HWINPUT=0.
         PointerFallback.install(on: self)
-        addSubview(externalLabel)
     }
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         GamepadEventClaim.install(on: self)
         PointerFallback.install(on: self)
-        addSubview(externalLabel)
     }
 
     // Visibility-stall postmortem (2026-07-03): the intermittent "presents
@@ -326,40 +244,38 @@ final class MetalBackedView: UIView {
     private static var pendingSettle: DispatchWorkItem?
     private static var lastApplied = ""
 
-    private func hostPlacement() -> (UIWindow, CGRect)? {
-        if !desktopMode, let ext = ExternalDisplay.shared.window {
-            let extRect = GameSurfaceLayout.rect(guest: guestSize(), aspect: drawableAspect(),
-                                                 bounds: ext.bounds, mode: effectiveDisplayMode())
-            return (ext, extRect)
-        }
-        guard let w = window else { return nil }
-        return (w, convert(gameRect(), to: w))
-    }
-
-    /// Sizes the presented layer's host view to gameRect(). `[display] apply`
-    /// is logged when the result changes.
+    /// Sizes the presented layer's host view to gameRect() on phone or to the
+    /// external TV Console container when active. `[display] apply` is logged when the result changes.
     private func applyDisplayMode(reason: String) {
-        guard let _ = window else { return }
-        ExternalDisplay.shared.setWanted(!desktopMode && (LibraryModel.shared.current != nil || !LibraryModel.shared.enabled))
+        guard let w = window else { return }
         let r = gameRect()
-        if let (targetWindow, rect) = hostPlacement() {
-            let host = MetalHostView.shared
-            if host.superview !== targetWindow {
+        let host = MetalHostView.shared
+        let onExternal = !desktopMode && ExternalDisplay.shared.isActive
+        if onExternal, let extWindow = ExternalDisplay.shared.window {
+            let ext = ExternalDisplay.shared
+            let extRect = ExternalDisplayLayout.rect(guest: guestSize(),
+                                                     aspect: drawableAspect(),
+                                                     bounds: extWindow.bounds,
+                                                     mode: ext.displayMode,
+                                                     aspectOverride: ext.aspectOverride,
+                                                     overscanPercent: ext.overscanPercent)
+            ext.mountGameLayer(host, rect: extRect)
+        } else {
+            if host.superview !== w {
                 host.removeFromSuperview()
-                targetWindow.addSubview(host)
+                w.addSubview(host)
                 let fpsSel = NSSelectorFromString("setNominalFramesPerSecond:")
                 if host.metalLayer.responds(to: fpsSel) {
-                    host.metalLayer.perform(fpsSel, with: targetWindow.screen.maximumFramesPerSecond as NSNumber)
+                    host.metalLayer.perform(fpsSel, with: w.screen.maximumFramesPerSecond as NSNumber)
                 }
             }
-            host.frame = rect
+            host.frame = convert(r, to: w)
         }
-        externalLabel.isHidden = desktopMode || ExternalDisplay.shared.window == nil
         // The desktop compositor lays the guest display out in the same rect,
         // so Aspect / Fill / Stretch / Fit apply to desktop sessions as well.
         winios_set_desktop_rect(r.minX - bounds.minX, r.minY - bounds.minY, r.width, r.height, 1)
         let guest = guestSize(), mode = effectiveDisplayMode()
-        let ext = !desktopMode && ExternalDisplay.shared.window != nil ? 1 : 0
+        let ext = onExternal ? 1 : 0
         let line = String(format: "mode=%@ guest=%.0fx%.0f bounds=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f) ext=%d",
                           mode.rawValue, guest.width, guest.height, bounds.width, bounds.height,
                           r.minX, r.minY, r.width, r.height, ext)
@@ -395,10 +311,7 @@ final class MetalBackedView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        guard let w = window else {
-            ExternalDisplay.shared.setWanted(false)
-            return
-        }
+        guard let w = window else { return }
         MetalBackedView.keyboardTarget = self  // keyboard button targets the live view
         // SwiftUI ancestors attach gesture recognizers that can delay or
         // cancel raw touch delivery (double-tap timing is exactly what
@@ -412,7 +325,6 @@ final class MetalBackedView: UIView {
             }
             v = s.superview
         }
-        let host = MetalHostView.shared
         applyDisplayMode(reason: "attach")
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
@@ -421,10 +333,10 @@ final class MetalBackedView: UIView {
         winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         if !Self.layerRegistered {
             Self.layerRegistered = true
-            madeira_display_set_layer(host.metalLayer)
+            madeira_display_set_layer(MetalHostView.shared.metalLayer)
             // DXMT writes drawableSize off the main thread; Aspect and Fill
             // height follow it, so a change re-lays-out on the main queue.
-            Self.drawableObservation = host.metalLayer.observe(\.drawableSize, options: [.new]) { _, _ in
+            Self.drawableObservation = MetalHostView.shared.metalLayer.observe(\.drawableSize, options: [.new]) { _, _ in
                 DispatchQueue.main.async { MetalBackedView.refreshDisplayMode(reason: "drawable") }
             }
             LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
@@ -433,7 +345,6 @@ final class MetalBackedView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        externalLabel.frame = bounds
         if let w = window {
             applyDisplayMode(reason: "layout")
             let full = convert(bounds, to: w)
@@ -1405,6 +1316,7 @@ struct ContentView: View {
     /// replaces both bodies below, and a running library session gets the
     /// full-screen `sessionBody`.
     @ObservedObject private var library = LibraryModel.shared
+    @ObservedObject private var external = ExternalDisplay.shared
     /// "Use New Interface" (actionButtons) applies at the next start.
     @State private var showFrontendRestart = false
 
@@ -1499,6 +1411,8 @@ struct ContentView: View {
                 // madeira-bcd: the Dock's Reset sets the VC++ markers back to a new prefix's
                 // values, read from the bundled prefix template (DockReset.swift).
                 DockReset.baselineProvider = { DockReset.templateRegistry { madeira_extract_prefix_tgz($0, $1) } }
+                ExternalDisplay.shared.onPlay = launchLibraryEntry
+                ExternalDisplay.shared.onEnableJIT = enableJIT
             }
             .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in
                 if !SteamSignIn.isSignedIn { MadeiraDock.cleanup() }
@@ -1554,6 +1468,22 @@ struct ContentView: View {
                     for: UIDevice.orientationDidChangeNotification)) { _ in
                     TouchControlsHost.attach()   // re-frame to the new bounds
                 }
+            if external.companionOwnsPhoneTouches {
+                ExternalPhoneCompanionView()
+            } else if external.isActive && !MetalBackedView.desktopMode {
+                Button {
+                    external.phoneMode = .companion
+                } label: {
+                    Label("Companion Deck", systemImage: "rectangle.grid.2x2")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(.regularMaterial, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topCenter)
+                .padding(.top, 12)
+            }
         }
         .ignoresSafeArea()
         .background(Color.black)
@@ -4357,6 +4287,9 @@ final class ControlsWindow: UIWindow {
         // The library itself, between sessions (a start that did not happen): nothing here.
         if library.enabled && library.current == nil { return nil }
         if library.current != nil {
+            if ExternalDisplay.shared.companionOwnsPhoneTouches {
+                return nil
+            }
             if library.menu || library.launching || library.menuButtonRect.contains(point) ||
                 (library.performance && library.performanceRect.contains(point)) {
                 return super.hitTest(point, with: event)

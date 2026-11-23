@@ -129,6 +129,8 @@ enum GuestDisplay {
     ///
     /// The size is also published to IOSDisplayShim, so a layout that already
     /// ran re-reads it (MadeiraDisplayModeChangedNotification).
+    static var externalResolutionOverride: ((_ gameResolution: String?) -> String?)?
+
     @discardableResult
     static func configureSessionDefault(view: CGSize, knob: String?) -> (w: Int, h: Int, source: String) {
         var mode = defaultMode(forLandscapeView: view)
@@ -138,6 +140,13 @@ enum GuestDisplay {
             if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 {
                 mode = (w, h)
                 source = "knob"
+            }
+        }
+        if let extRaw = externalResolutionOverride?(knob)?.trimmingCharacters(in: .whitespacesAndNewlines), !extRaw.isEmpty {
+            let parts = extRaw.lowercased().split(separator: "x")
+            if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 {
+                mode = (w, h)
+                source = "external"
             }
         }
         setenv("MADEIRA_SCREEN_W", String(mode.w), 1)

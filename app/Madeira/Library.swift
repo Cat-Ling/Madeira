@@ -3440,7 +3440,9 @@ struct LibraryView: View {
         // on either tab (start() does nothing while liquid metal is off).
         .onAppear { GlassSkin.shared.start() }
         .onDisappear { GlassSkin.shared.stop() }
+        .safeAreaInset(edge: .top) { ExternalLibraryBanner() }
         .onReceive(controller.commands) { command in
+            guard !ExternalDisplay.shared.consoleOwnsInput else { return }
             if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
         }
     }
@@ -3707,6 +3709,7 @@ struct LibraryView: View {
         }
         .refreshable { await SteamGamesSection.refresh() }
         .onReceive(controller.commands) { command in
+            guard !ExternalDisplay.shared.consoleOwnsInput else { return }
             guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
             let items = focusOrder
             let ids = [LibraryEntry.desktopID] + items.map(\.id)
@@ -3791,6 +3794,7 @@ struct LibraryView: View {
                         open: { selected = $0 },
                         desktop: { AnyView(desktopButton) })
         .onReceive(controller.commands) { command in
+            guard !ExternalDisplay.shared.consoleOwnsInput else { return }
             guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
             let items = focusOrder
             let ids = [LibraryEntry.desktopID] + items.map(\.id)
@@ -4632,6 +4636,7 @@ struct LibraryDetail: View {
         }
         .onDisappear { if !leaving { model.save(entry) } }
         .onReceive(LibraryController.shared.commands) { command in
+            guard !ExternalDisplay.shared.consoleOwnsInput else { return }
             guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
             if command == "back" {
                 if path.isEmpty { model.save(entry); dismiss() } else { path.removeLast() }
@@ -5591,6 +5596,7 @@ struct LibraryHUD: View {
     }
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
+    @ObservedObject private var external = ExternalDisplay.shared
     @AppStorage(TouchControlStyle.key) private var controlStyle = "glass"
     /// A Madeira Dock start: its status, failure and Show desktop (DockStartScreen).
     @ObservedObject private var dockStart = DockStartScreen.shared
@@ -5617,8 +5623,9 @@ struct LibraryHUD: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
+            let externalCompanion = external.isActive && !MetalBackedView.desktopMode && external.phoneMode == .companion
             ZStack(alignment: .topLeading) {
-                if model.startingScreen, let entry = model.startingEntry {
+                if model.startingScreen, !externalCompanion, let entry = model.startingEntry {
                     // An opaque base first, so the desktop never shows through while the
                     // backdrop fades in; the backdrop settles from a slight zoom and the
                     // screen's parts arrive one after another (LaunchEntrance).
@@ -5634,11 +5641,11 @@ struct LibraryHUD: View {
                     // (and measured) all the same.
                     launchView(entry, geometry: geo).opacity(curtain.hidesStartingScreen ? 0 : 1)
                 }
-                if !model.startingScreen && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
-                if model.liveLogs && !model.startingScreen { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
-                if !model.sessionMessage.isEmpty && !model.startingScreen { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
-                if !model.startingScreen { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
-                if model.menu {
+                if !model.startingScreen && !externalCompanion && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
+                if model.liveLogs && !model.startingScreen && !externalCompanion { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
+                if !model.sessionMessage.isEmpty && !model.startingScreen && !externalCompanion { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
+                if !model.startingScreen && !externalCompanion { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
+                if model.menu && !externalCompanion {
                     Color.black.opacity(SessionMenuBackground.blur ? 0.3 : 0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
                     (bindsPage ? AnyView(bindsMenu) : assistPage ? AnyView(assistMenu) : AnyView(menu))
                         .frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
@@ -5678,13 +5685,14 @@ struct LibraryHUD: View {
         .onAppear { model.saveCurrentProfile() }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
+            HardwareInput.shared.syncConsoleRouting(isActive: ExternalDisplay.shared.isActive, consoleOwnsInput: ExternalDisplay.shared.consoleOwnsInput)
             if !open { bindsPage = false; assistPage = false }
             if !open { model.saveCurrentProfile() }
             if open { eco = madeira_get_eco() != 0; fenceMode = FPSOverlayFenceMode.current }
         }
         .onReceive(LibraryController.shared.commands) { command in
             if command == "menu" { if model.menu { model.menu = false } else { model.showMenu() } }
-            else if command == "back", model.menu { model.menu = false }
+            else if command == "back", model.menu, !ExternalDisplay.shared.consoleOwnsInput { model.menu = false }
         }
     }
     /// Landscape: the cover large on the left, the title, status and controls beside it

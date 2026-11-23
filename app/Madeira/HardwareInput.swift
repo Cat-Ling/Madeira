@@ -848,6 +848,7 @@ final class HardwareInput: ObservableObject {
     /// `currentRoute`, for the mouse queue.
     private var route: PointerRoute = .relative
     private var mouseInUseMirror = false
+    private var consoleInputActive = false
     /// A GCMouse delta inside this many seconds means the hand is on the mouse
     /// and a `.direct` touch is AssistiveTouch's, not a finger's.
     private static let mouseActiveWindow: CFTimeInterval = 2.0
@@ -1026,6 +1027,13 @@ final class HardwareInput: ObservableObject {
 
     // MARK: - focus
 
+    func syncConsoleRouting(isActive: Bool, consoleOwnsInput: Bool) {
+        motionLock.lock()
+        consoleInputActive = isActive && consoleOwnsInput
+        motionLock.unlock()
+        refreshFocus("external-console")
+    }
+
     /// Everything that decides where input goes, re-evaluated from scratch.
     /// Cheap (a few property reads and one responder-chain walk); called on
     /// every focus-relevant event and four times a second while an input
@@ -1044,12 +1052,17 @@ final class HardwareInput: ObservableObject {
     private func evaluateFocus(_ why: String) {
         installTouchObserver()
         let base = computeBaseFocus()
-        let keyboard = base && !typingElsewhere() && !libraryTypingOwnsKeys
+        let extOwnsConsole = ExternalDisplay.shared.consoleOwnsInput
+        motionLock.lock()
+        consoleInputActive = extOwnsConsole
+        motionLock.unlock()
+        let keyboard = base && !extOwnsConsole && !typingElsewhere() && !libraryTypingOwnsKeys
         // iPhone: the AssistiveTouch pointer's hover ends whenever it stops
         // against a screen edge, while GCMouse deltas keep coming; following
         // hover there dropped mouse-look at every edge. Clicks decide instead.
         let over = hoverSeen && !Self.isPhone ? pointerOver : clickFocus.onGame
-        let mouse = base && (!Self.focusEnabled || pointerLocked || over || !gameButtons.isEmpty)
+        let tvGameplay = ExternalDisplay.shared.isGameplayOnExternal
+        let mouse = base && !extOwnsConsole && (tvGameplay || !Self.focusEnabled || pointerLocked || over || !gameButtons.isEmpty)
         baseFocused = base
         updateButtonPolling(active: Self.mouseRoutingEnabled && appActive && mouseConnected)
         if keyboard != keyboardFocused {
@@ -1082,6 +1095,7 @@ final class HardwareInput: ObservableObject {
     private func computeBaseFocus() -> Bool {
         guard appActive, UIApplication.shared.applicationState == .active else { return false }
         if LibraryModel.shared.enabled && LibraryModel.shared.menu { return false }
+        if ExternalDisplay.shared.isGameplayOnExternal { return true }
         guard Self.focusEnabled else { return true }
         guard let v = MetalBackedView.keyboardTarget, let w = v.window,
               !v.isHidden, !w.isHidden, v.alpha > 0.01 else { return false }
@@ -1171,6 +1185,16 @@ final class HardwareInput: ObservableObject {
             // An unmapped key is a key the program did not receive; the usage
             // number names it exactly.
             if pressed { log("unmapped HID usage 0x\(String(code.rawValue, radix: 16))") }
+            return
+        }
+        if pressed && ExternalDisplay.shared.isGameplayOnExternal && vk == 0x79 {
+            _ = ExternalConsoleController.shared.handleKey(vk: vk)
+            keys.focusLost(); syncKeys()
+            return
+        }
+        if ExternalDisplay.shared.consoleOwnsInput {
+            if pressed { _ = ExternalConsoleController.shared.handleKey(vk: vk) }
+            keys.focusLost(); syncKeys()
             return
         }
         refreshFocus("key")
@@ -1450,7 +1474,15 @@ final class HardwareInput: ObservableObject {
         noteDelivery(now)
         var first = false, wake = false
         motionLock.lock()
+        let consoleRouting = consoleInputActive
         let r = route
+        if consoleRouting {
+            motionLock.unlock()
+            DispatchQueue.main.async {
+                ExternalConsoleController.shared.moveCursor(dx: dx, dy: -dy)
+            }
+            return
+        }
         if dx != 0 || dy != 0 {
             lastGCDeltaAt = now
             if !gcDeltaLive { gcDeltaLive = true; first = true }
@@ -1592,6 +1624,10 @@ final class HardwareInput: ObservableObject {
     /// A press goes to the program only if it has the mouse's focus when the
     /// press happens; a release always follows its press. Main thread.
     private func buttonChanged(_ b: MouseButton, _ pressed: Bool, at t: CFTimeInterval) {
+        if ExternalDisplay.shared.consoleOwnsInput {
+            ExternalConsoleController.shared.handleMouseButton(b, pressed: pressed)
+            return
+        }
         gcButtonSeen = true
         gcButtonsSeen.insert(b)
         if pressed {
@@ -1657,6 +1693,14 @@ final class HardwareInput: ObservableObject {
     /// which only scrolls a view the pointer is over).
     private func scrolled(_ x: Double, _ y: Double) {
         motionLock.lock()
+        let consoleRouting = consoleInputActive
+        if consoleRouting {
+            motionLock.unlock()
+            DispatchQueue.main.async {
+                ExternalConsoleController.shared.handleMouseScroll(dx: x, dy: y)
+            }
+            return
+        }
         let blocked = route == .blocked
         let notches = blocked ? [] : wheel.add(x, y)
         tickWheel += notches.count
