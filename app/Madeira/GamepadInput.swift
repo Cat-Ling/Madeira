@@ -318,6 +318,8 @@ final class GamepadInput: @unchecked Sendable {
     private let queue = DispatchQueue(label: "madeira.gamepad", qos: .userInteractive)
     private var controllers = [GCController?](repeating: nil, count: 4)
     private var profiles = [GCExtendedGamepad?](repeating: nil, count: 4)
+    /// Accessories Over LAN (AoL): remote XInput snapshots per slot (0-3), queue-owned.
+    private var remotePads = [GamepadSample?](repeating: nil, count: 4)
     private var timer: DispatchSourceTimer?
     private var active = false
     /// ml2100: player 1 goes to the HID controller (beginPadSession); queue-owned.
@@ -478,11 +480,32 @@ final class GamepadInput: @unchecked Sendable {
         }
     }
 
+    /// Accessories Over LAN (AoL): inject or clear one remote controller slot (0-3).
+    func setRemotePad(slot: Int, sample remoteSample: GamepadSample?) {
+        guard (0..<4).contains(slot) else { return }
+        queue.async { [self] in
+            remotePads[slot] = remoteSample
+            updateTimer()
+            sample()
+        }
+    }
+
+    /// Accessories Over LAN (AoL): disconnect all remote controllers and release rest state.
+    func clearRemotePads() {
+        queue.async { [self] in
+            remotePads = [GamepadSample?](repeating: nil, count: 4)
+            updateTimer()
+            sample()
+        }
+    }
+
     private func updateTimer() {
         // Touch play with gyro aim (the device's gyro) or turbo is polled as a pad is.
         // So is gyro aim moving the mouse with no controller at all.
         let mouseGyro = assist.map { $0.gyro && $0.output != .stick } ?? false
-        let needed = active && (profiles.contains(where: { $0 != nil }) || (assist != nil && (touchState.connected || mouseGyro)))
+        let needed = active && (profiles.contains(where: { $0 != nil })
+            || remotePads.contains(where: { $0 != nil })
+            || (assist != nil && (touchState.connected || mouseGyro)))
         if !needed { timer?.cancel(); timer = nil; return }
         guard timer == nil else { return }
         let source = DispatchSource.makeTimerSource(queue: queue)
@@ -509,6 +532,7 @@ final class GamepadInput: @unchecked Sendable {
     private func sample() {
         for i in profiles.indices {
             let pad = profiles[i]
+            let remotePad = remotePads[i]
             let touchConnected = i == 0 && touchState.connected
             // Player 1's pad went away mid-press: nothing feeds the driver now, so
             // release the keys and buttons it holds.
@@ -516,7 +540,7 @@ final class GamepadInput: @unchecked Sendable {
                 PadKeyboardMouse.shared.releaseAll("controller disconnected")
             }
             let hid = i == 0 && hidActive
-            guard pad != nil || touchConnected else {
+            guard pad != nil || touchConnected || remotePad != nil else {
                 // No controller for the game: gyro aim can still move the mouse
                 // (with nothing to hold, only "Always" does).
                 if i == 0, active, let assist, gyroMouse(physical: false, touch: false) {
@@ -571,7 +595,10 @@ final class GamepadInput: @unchecked Sendable {
                 // sees a connected pad at rest.
                 if i == 0 {
                     let library = LibraryController.shared
-                    library.sample(buttons: state.buttons, lx: state.lx, ly: state.ly)
+                    let navButtons = state.buttons | (remotePad?.buttons ?? 0)
+                    let navLX = abs(Int(state.lx)) > 7849 ? state.lx : (remotePad?.lx ?? 0)
+                    let navLY = abs(Int(state.ly)) > 7849 ? state.ly : (remotePad?.ly ?? 0)
+                    library.sample(buttons: navButtons, lx: navLX, ly: navLY)
                     if library.ownsInput {
                         state = winios_gamepad()
                         state.connected = 1
@@ -589,7 +616,7 @@ final class GamepadInput: @unchecked Sendable {
                                                      lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry,
                                                      bindings: kbm, focused: HardwareInput.shared.baseFocused)
                         hidLive = nil
-                        guard touchConnected else {
+                        guard touchConnected || remotePad != nil else {
                             winios_gamepad_set_state(Int32(i), nil)
                             if hid { winios_hidpad_set_state(nil) }
                             continue
@@ -598,12 +625,25 @@ final class GamepadInput: @unchecked Sendable {
                         state.connected = 1
                     }
                 }
+            } else if active, let remotePad, i == 0 {
+                let library = LibraryController.shared
+                library.sample(buttons: remotePad.buttons, lx: remotePad.lx, ly: remotePad.ly)
+                if library.ownsInput { assisted = true }
             }
             if active && touchConnected {
                 let physical = GamepadSample(buttons: state.buttons,
                     lt: state.left_trigger, rt: state.right_trigger,
                     lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry)
                 let merged = GamepadSample.merge(physical: physical, touch: touchState.sample)
+                state.buttons = merged.buttons
+                state.left_trigger = merged.lt; state.right_trigger = merged.rt
+                state.lx = merged.lx; state.ly = merged.ly; state.rx = merged.rx; state.ry = merged.ry
+            }
+            if active, let remotePad, i != 0 || !LibraryController.shared.ownsInput {
+                let current = GamepadSample(buttons: state.buttons,
+                    lt: state.left_trigger, rt: state.right_trigger,
+                    lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry)
+                let merged = GamepadSample.merge(physical: current, touch: remotePad)
                 state.buttons = merged.buttons
                 state.left_trigger = merged.lt; state.right_trigger = merged.rt
                 state.lx = merged.lx; state.ly = merged.ly; state.rx = merged.rx; state.ry = merged.ry

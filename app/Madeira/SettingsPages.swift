@@ -15,7 +15,7 @@ enum SettingsPages {
     static var enabled: Bool { MadeiraConfig.flag("MADEIRA_SETTINGS_PAGES") }
 
     enum Page: Hashable, CaseIterable {
-        case steam, gog, itch, epic, ea, runtimes, graphics, display, memory, pointer, jit, signing, saves, drives,
+        case steam, gog, itch, epic, ea, runtimes, graphics, display, memory, pointer, aol, jit, signing, saves, drives,
              appearance, advanced, credits
 
         var title: String {
@@ -30,6 +30,7 @@ enum SettingsPages {
             case .display: return "Display"
             case .memory: return "Memory and sync"
             case .pointer: return "Pointer and touch"
+            case .aol: return "Accessories Over LAN"
             case .jit: return "JIT"
             case .signing: return "Signing"
             case .saves: return "Saves and backups"
@@ -52,6 +53,7 @@ enum SettingsPages {
             case .display: return "display"
             case .memory: return "memorychip"
             case .pointer: return "cursorarrow"
+            case .aol: return "antenna.radiowaves.left.and.right"
             case .jit: return "bolt"
             case .signing: return "signature"
             case .saves: return "externaldrive.badge.timemachine"
@@ -81,7 +83,7 @@ enum SettingsPages {
     /// The rows of the Settings tab, in groups.
     static let groups: [(String?, [Page])] = [
         ("Getting games", [.steam, .gog, .itch, .epic, .ea, .runtimes]),
-        ("Running games", [.graphics, .display, .memory, .pointer]),
+        ("Running games", [.graphics, .display, .memory, .pointer, .aol]),
         ("Device", [.jit, .signing, .saves, .drives]),
         (nil, [.appearance, .advanced, .credits]),
     ]
@@ -92,6 +94,7 @@ struct SettingsPagesList: View {
     var startDock: (DockGame, Bool) -> Void
     @ObservedObject private var jitState = LibraryJITState.shared
     @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
+    @ObservedObject private var aolState = AccessoriesOverLAN.shared
 
     var body: some View {
         Form {
@@ -119,6 +122,9 @@ struct SettingsPagesList: View {
 
     private func summary(_ page: SettingsPages.Page) -> String? {
         switch page {
+        case .aol:
+            if aolState.clientConnected { return aolState.clientHost }
+            return aolState.enabled ? "Listening" : "Off"
         case .jit: return jitState.enabled ? "On" : "Off"
         case .appearance: return liquidMetal.on ? "Liquid metal" : "Liquid Glass"
         default: return nil
@@ -176,6 +182,7 @@ struct SettingsPageView: View {
         case .display: DisplayRateSettings()
         case .memory: RuntimeMemorySyncSettings(open: { sheet = $0 }, refresh: refresh)
         case .pointer: Section("Pointer") { LibraryPointerSettings() }
+        case .aol: AccessoriesOverLANSettingsSection()
         case .jit: JITSettingsSection()
         case .signing: SigningSettingsSection()
         case .saves: SavesSection()

@@ -1,0 +1,79 @@
+.\" SPDX-FileCopyrightText: 2026 Cat-Ling
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.TH MADEIRA-AOL 1 "November 2026" "madeira-aol 1.0.0" "User Commands"
+.SH NAME
+madeira-aol \- forward PC keyboard, mouse, and gamepad input over LAN to Madeira
+.SH SYNOPSIS
+.B madeira-aol
+[\fIOPTION\fR]...
+.SH DESCRIPTION
+.B madeira-aol
+captures local keyboard, relative mouse, and game controller events on a desktop
+computer and streams them over UDP to Madeira running Accessories Over LAN (AoL)
+on iOS or iPadOS. Controller vibration feedback sent by Madeira is forwarded back
+to connected PC controllers.
+.PP
+While capture is active on Linux or Windows, pressing
+.B Ctrl+Alt+G
+toggles exclusive keyboard and mouse grab.
+.SH OPTIONS
+.TP
+.BR \-d ", " \-\-discover
+Broadcast a discovery probe on the LAN, print responding Madeira devices, and exit.
+.TP
+.BR \-t ", " \-\-target =\fIHOST[:PORT]\fR
+Connect to Madeira at \fIHOST\fR (default port 37419 if omitted).
+.TP
+.BR \-p ", " \-\-port =\fIPORT\fR
+UDP port used for discovery or default target connections (default 37419).
+.TP
+.BR \-\-pin =\fIPIN\fR
+Four-digit or passphrase PIN matching Madeira's AoL settings.
+.TP
+.B \-\-no\-keyboard
+Do not forward keyboard events.
+.TP
+.B \-\-no\-mouse
+Do not forward mouse motion, buttons, or wheel events.
+.TP
+.B \-\-no\-gamepad
+Do not forward gamepad input or rumble.
+.TP
+.B \-\-no\-grab
+Read input devices without taking an exclusive desktop grab.
+.TP
+.B \-\-no\-rumble
+Ignore incoming rumble packets from Madeira.
+.TP
+.B \-\-json
+Emit discovery results as JSON to standard output.
+.TP
+.BR \-\-color =\fIWHEN\fR
+Colorize diagnostics: \fBauto\fR, \fBalways\fR, or \fBnever\fR.
+.TP
+.B \-\-no\-color
+Disable colored diagnostics.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress informational diagnostics.
+.TP
+.BR \-v ", " \-\-verbose
+Print detailed connection, packet, and device diagnostics to standard error.
+.TP
+.BR \-h ", " \-\-help
+Display usage information and exit.
+.TP
+.BR \-V ", " \-\-version
+Display version and license information and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Network, device, authentication, or runtime failure.
+.TP
+.B 2
+Invalid command-line usage.
+.SH LICENSE
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.

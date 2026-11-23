@@ -38,6 +38,7 @@ struct MadeiraApp: App {
                     GamepadInput.shared.start()
                     HardwareInput.shared.start()
                     ExternalDisplay.shared.start()
+                    AccessoriesOverLAN.shared.startIfEnabled()
                     JITNetworkShortcut.shared.restoreLeftover()   // also starts its network path monitor
                     WineGeckoModel.shared.installAutomatically()  // on Wi-Fi, so Wine never asks (WineGecko.swift)
                     AchievementWatcher.shared.start()             // unlock banners from Steam's stats files (SteamAchievements.swift)

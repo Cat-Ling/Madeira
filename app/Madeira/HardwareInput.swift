@@ -806,6 +806,9 @@ final class HardwareInput: ObservableObject {
     private var pressGen: [MouseButton: Int] = [:]
     private var gcButtonSeen = false
     private var buttonRouteTraceCount = 0
+    private var remoteKeysPosted = HeldEdges<Int32>()
+    private var remoteButtonsPosted = HeldEdges<MouseButton>()
+    private var remoteConsoleButtons = HeldEdges<MouseButton>()
 
     private var programHidesCursor: Bool {
         (cursorState.reports != 0 && cursorState.shown == 0)
@@ -2033,6 +2036,97 @@ final class HardwareInput: ObservableObject {
         if assistiveTouchHint { assistiveTouchHint = false }
         noteMousePresent()
         announcePath(.uikit)
+    }
+
+    // MARK: - Accessories Over LAN (AoL) injection
+
+    func injectRemoteKey(hidUsage: UInt16, pressed: Bool, heldUsages: Set<UInt16>) {
+        tickKeys += 1
+        let vk = HardwareKeyMap.vk(forHIDUsage: Int(hidUsage))
+        if pressed, ExternalDisplay.shared.isGameplayOnExternal, vk == 0x79 {
+            ExternalConsoleController.shared.lastInputKind = .remoteLAN
+            _ = ExternalConsoleController.shared.handleKey(vk: 0x79)
+            releaseRemoteKeys()
+            return
+        }
+        if ExternalDisplay.shared.consoleOwnsInput {
+            releaseRemoteKeys()
+            if pressed, let vk {
+                ExternalConsoleController.shared.lastInputKind = .remoteLAN
+                _ = ExternalConsoleController.shared.handleKey(vk: vk)
+            }
+            return
+        }
+        refreshFocus("remote AoL key")
+        guard Self.enabled, computeBaseFocus(), !typingElsewhere() else {
+            releaseRemoteKeys()
+            return
+        }
+        var wantVks = Set(heldUsages.compactMap { HardwareKeyMap.vk(forHIDUsage: Int($0)) })
+        if pressed, let vk { wantVks.insert(vk) }
+        let edges = remoteKeysPosted.update(wantVks)
+        for released in edges.up { winios_post_key(released, 0) }
+        for pressedKey in edges.down { winios_post_key(pressedKey, 1) }
+        startTicker()
+    }
+
+    func injectRemoteMouse(dx: Int32, dy: Int32, wheelX: Int32, wheelY: Int32,
+                           buttonMask: UInt8, updateButtons: Bool) {
+        if ExternalDisplay.shared.consoleOwnsInput {
+            let gameUps = remoteButtonsPosted.update([]).up
+            for b in gameUps { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
+            ExternalConsoleController.shared.lastInputKind = .remoteLAN
+            if dx != 0 || dy != 0 {
+                ExternalConsoleController.shared.moveCursor(dx: Double(dx), dy: Double(dy))
+            }
+            if wheelX != 0 || wheelY != 0 {
+                ExternalConsoleController.shared.handleMouseScroll(dx: Double(wheelX), dy: Double(wheelY))
+            }
+            if updateButtons {
+                let consoleEdges = remoteConsoleButtons.update(AOLMouseButtonMask.buttons(from: buttonMask))
+                for b in consoleEdges.up { ExternalConsoleController.shared.handleMouseButton(b, pressed: false) }
+                for b in consoleEdges.down { ExternalConsoleController.shared.handleMouseButton(b, pressed: true) }
+            }
+            return
+        }
+        guard Self.enabled else { return }
+        _ = remoteConsoleButtons.update([])
+        let focused = computeBaseFocus()
+        if focused {
+            if dx != 0 || dy != 0 {
+                setMouseInUse(true)
+                postMotion(Double(dx), Double(dy))
+            }
+            if wheelX != 0 || wheelY != 0 {
+                motionLock.lock()
+                let notches = wheel.add(Double(wheelX), Double(wheelY))
+                tickWheel += notches.count
+                motionLock.unlock()
+                for n in notches { winios_pointer(0, 0, n.flags, UInt32(bitPattern: n.delta)) }
+                if !notches.isEmpty { bumpTicker() }
+            }
+        }
+        if updateButtons {
+            let wantButtons = focused ? AOLMouseButtonMask.buttons(from: buttonMask) : []
+            if !wantButtons.isEmpty { setMouseInUse(true) }
+            let edges = remoteButtonsPosted.update(wantButtons)
+            for b in edges.up { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
+            for b in edges.down { let e = b.event(down: true); winios_pointer(0, 0, e.flags, e.data) }
+        }
+        startTicker()
+    }
+
+    func releaseAllRemoteInput() {
+        releaseRemoteKeys()
+        let gameUps = remoteButtonsPosted.update([]).up
+        for b in gameUps { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
+        _ = remoteConsoleButtons.update([])
+    }
+
+    private func releaseRemoteKeys() {
+        for vk in remoteKeysPosted.update([]).up {
+            winios_post_key(vk, 0)
+        }
     }
 
     // MARK: - pointer lock

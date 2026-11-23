@@ -78,9 +78,10 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_remotepairing-pairable-host._tcp</string>
+		<string>_madeira-aol._udp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Madeira uses the local network to pair with this device for JIT, without a computer, and to download Steam games from a PC on this network.</string>
+	<string>Madeira uses the local network to pair with this device for JIT, without a computer, to download Steam games from a PC on this network, and to receive Accessories Over LAN input from a PC.</string>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
