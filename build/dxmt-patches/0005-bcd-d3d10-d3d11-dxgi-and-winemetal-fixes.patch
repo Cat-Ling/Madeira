@@ -1,0 +1,667 @@
+diff --git a/src/airconv/dxbc_signature.cpp b/src/airconv/dxbc_signature.cpp
+index 792e94a..1548142 100644
+--- a/src/airconv/dxbc_signature.cpp
++++ b/src/airconv/dxbc_signature.cpp
+@@ -1,4 +1,5 @@
+ #include "dxbc_converter.hpp"
++#include <cstdio> /* madeira-bcd: [gs-siv] */
+ #include <format>
+ 
+ using namespace microsoft;
+@@ -1039,6 +1040,7 @@ handle_signature_gs(
+     auto sgv = Inst.m_InputDeclSGV.Name;
+     switch (sgv) {
+     default:
++      fprintf(stderr, "[gs-siv] madeira-bcd: geometry shader input generated value %u is not handled\n", (unsigned)sgv);
+       assert(0 && "Unexpected/unhandled geometry shader sgv");
+       break;
+     }
+@@ -1050,7 +1052,17 @@ handle_signature_gs(
+     switch (siv) {
+     case D3D10_SB_NAME_POSITION:
+       break;
++    /* madeira-bcd: geometry shader input system values -- the GS copies the
++     * vertex stage's whole output register file (load_vertex), and the vertex
++     * stage counts these registers in max_output_register, so they read like
++     * SV_Position: plain input registers. GTA V Legacy aborted here. */
++    case D3D10_SB_NAME_CLIP_DISTANCE:
++    case D3D10_SB_NAME_CULL_DISTANCE:
++    case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX:
++    case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX:
++      break;
+     default:
++      fprintf(stderr, "[gs-siv] madeira-bcd: geometry shader input system value %u is not handled\n", (unsigned)siv);
+       assert(0 && "Unexpected/unhandled geometry shader siv");
+       break;
+     }
+@@ -1066,7 +1078,14 @@ handle_signature_gs(
+     }
+     case microsoft::D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
+       break;
++    /* madeira-bcd: geometry shader instance id -- dcl_input vGSInstanceID of a [instance(N)] geometry shader. The converter
++     * already reads it (InputAttribute::GSInstanceId <- resource_map.gs_instance_id, the threadgroup position's second
++     * component) and sizes the mesh grid by dcl_gsinstances; like the hull shader's fork/join instance ids, the
++     * declaration needs nothing else. ROBOBEAT aborted here. */
++    case microsoft::D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
++      break;
+     default:
++      fprintf(stderr, "[gs-input] madeira-bcd: geometry shader input register type %u is not handled\n", (unsigned)RegType);
+       assert(0 && "unhandled geometry shader input");
+       break;
+     }
+diff --git a/src/d3d10/d3d10_device.cpp b/src/d3d10/d3d10_device.cpp
+index 68a9a69..6829a39 100644
+--- a/src/d3d10/d3d10_device.cpp
++++ b/src/d3d10/d3d10_device.cpp
+@@ -136,7 +136,7 @@ MTLD3D10Device::DrawIndexedInstanced(
+     UINT StartInstanceLocation
+ ) {
+   d3d11_context_->DrawIndexedInstanced(
+-      IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartIndexLocation
++      IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation
+   );
+ }
+ 
+@@ -498,7 +498,7 @@ MTLD3D10Device::IAGetIndexBuffer(ID3D10Buffer **pIndexBuffer, DXGI_FORMAT *Forma
+     if (d3d11_buffer)
+       d3d11_buffer->QueryInterface(IID_PPV_ARGS(pIndexBuffer));
+     else
+-      pIndexBuffer = nullptr;
++      *pIndexBuffer = nullptr;
+   }
+ }
+ 
+@@ -907,6 +907,10 @@ MTLD3D10Device::CreateRenderTargetView(
+   if (hr != S_OK)
+     return hr;
+ 
++  /* madeira-bcd: render target views on a buffer. S_OK with no view (env.MADEIRA_BUFFER_RTV_EMPTY): no view here either. */
++  if (ppRTView && !d3d11_view)
++    return S_OK;
++
+   return ppRTView ? d3d11_view->QueryInterface(IID_PPV_ARGS(ppRTView)) : hr;
+ }
+ 
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 7257ecf..7b2e8eb 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -6,6 +6,7 @@ and should be not used as a compilation unit
+ since it is for internal use only
+ (and I don't want to deal with several thousands line of code)
+ */
++#include <atomic>
+ #include "Metal.hpp"
+ #include "config/config.hpp"   /* ml869 */
+ #include <deque>   /* ml1256 */
+@@ -68,6 +69,17 @@ static inline bool dxmt_no_mesh_draws() {
+   return true;
+ }
+ 
++/* madeira-bcd tess-pso-failed-v1 (round 626, Batman: Arkham City 9AGR39/AE9TXK; tools/patch-dxmt-tess-pso-failed.py): a tessellation
++ * or geometry mesh pipeline that did not compile (Metal: "Total mesh size (33792) exceeds the maximum mesh size allowed (32768)")
++ * left no pipeline bound, and the mesh draws that followed made the driver fault in drawMeshThreadgroups. Those draws are dropped
++ * until a pipeline of that kind compiles again; said once, then every 1024th time. */
++static inline void madeira_mesh_pso_missing(const char *kind) {
++  static std::atomic<uint32_t> missing{0};
++  uint32_t n = missing.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n == 1 || (n & 0x3FF) == 0)
++    ERR("[mesh-skip] ml870 ", kind, " mesh pipeline missing (#", n, "): its draws are dropped until one compiles");
++}
++
+ 
+ template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj);
+ 
+@@ -874,6 +886,10 @@ public:
+   void
+   STDMETHODCALLTYPE
+   ClearRenderTargetView(ID3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) override {
++    /* madeira-bcd: render target views on a buffer. A null view is ignored, as in DXVK (it was dereferenced). */
++    if (!pRenderTargetView)
++      return;
++
+     std::lock_guard<mutex_t> lock(mutex);
+ 
+     ClearRenderTargetView(static_cast<D3D11RenderTargetView *>(pRenderTargetView), ColorRGBA);
+@@ -1336,8 +1352,19 @@ public:
+ 
+     if (auto dst_bind = reinterpret_cast<D3D11ResourceCommon *>(pDstBuffer)) {
+       if (auto uav = static_cast<D3D11UnorderedAccessView *>(pSrcView)) {
++        /* madeira-bcd: CopyStructureCount without a buffer (round 620, F1 2020: 4W6WMV, G1WB9T). The encoder lambda
++         * dereferenced an empty destination or counter on the encode thread and the process died; skip such a call. */
++        auto dst_rc = dst_bind->buffer();
++        auto counter_rc = uav->counter();
++        if (!dst_rc || !counter_rc) {
++          static std::atomic<unsigned> skipped{0};
++          unsigned n = ++skipped;
++          if (n <= 8 || !(n & (n - 1)))
++            ERR("[copy-structure-count] skipped #", n, ": ", !dst_rc ? "the destination has no Metal buffer" : "the view has no counter");
++          return;
++        }
+         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+-        EmitOP([=, dst = dst_bind->buffer(), counter = uav->counter()](ArgumentEncodingContext &enc) {
++        EmitOP([=, dst = std::move(dst_rc), counter = std::move(counter_rc)](ArgumentEncodingContext &enc) {
+           auto [dst_buffer, dst_offset] = enc.access(dst, DstAlignedByteOffset, 4, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+           auto [counter_buffer, counter_offset] = enc.access(counter, 0, 4, DXMT_ENCODER_RESOURCE_ACESS_READ);
+           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+@@ -1414,10 +1441,22 @@ public:
+         //   buffer->didModifyRange(NS::Range::Make(copy_offset, copy_len));
+         //   return;
+         // }
++        /* madeira-bcd: UpdateSubresource on a staging buffer (night round 2026-11-11, FIFA 23: HPM5D7, KAXT96). Direct3D 11 drops an
++         * update of a resource the GPU cannot reach (Wine's wined3d: "Resource %p is not GPU accessible"). StagingBuffer::buffer() is an
++         * empty Rc (d3d11_resource_staging.cpp); the encoder lambda below dereferenced it on the encode thread (d3d11.dll+0x98818,
++         * `ldr x19,[x8,#8]` with x8 = 0) and the process died with c0000005. A call with a Metal buffer behind it is unchanged. */
++        auto dst_rc = bindable->buffer();
++        if (!dst_rc) {
++          static std::atomic<unsigned> skipped{0};
++          unsigned n = ++skipped;
++          if (n <= 8 || !(n & (n - 1)))
++            ERR("[update-subresource-staging] skipped #", n, ": the destination buffer has no Metal buffer (a STAGING buffer)");
++          return;
++        }
+         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
+         staging_buffer.updateContents(offset, pSrcData, copy_len);
+         SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+-        EmitOP([staging_buffer, offset, dst = bindable->buffer(), copy_offset, copy_len](ArgumentEncodingContext &enc) {
++        EmitOP([staging_buffer, offset, dst = std::move(dst_rc), copy_offset, copy_len](ArgumentEncodingContext &enc) {
+           auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+           cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+@@ -1689,6 +1728,7 @@ public:
+     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
+     auto max_object_threadgroups = max_object_threadgroups_;
+     EmitOP([=](ArgumentEncodingContext &enc) {
++      if (enc.tess_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+       DXMT_DRAW_ARGUMENTS *draw_arugment = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
+       draw_arugment->StartVertex = StartVertexLocation;
+       draw_arugment->VertexCount = VertexCountPerInstance;
+@@ -1728,6 +1768,7 @@ public:
+     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
+     auto max_object_threadgroups = max_object_threadgroups_;
+     EmitOP([=](ArgumentEncodingContext &enc) {
++      if (enc.tess_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+       DXMT_DRAW_INDEXED_ARGUMENTS *draw_arugment = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
+       draw_arugment->BaseVertex = BaseVertexLocation;
+       draw_arugment->IndexCount = IndexCountPerInstance;
+@@ -1770,6 +1811,7 @@ public:
+     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
+     auto max_object_threadgroups = max_object_threadgroups_;
+     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
++      if (enc.gs_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+       DXMT_DRAW_ARGUMENTS *draw_arugment = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
+       draw_arugment->StartVertex = StartVertexLocation;
+       draw_arugment->VertexCount = VertexCountPerInstance;
+@@ -1803,6 +1845,7 @@ public:
+     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
+     auto max_object_threadgroups = max_object_threadgroups_;
+     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
++      if (enc.gs_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+       DXMT_DRAW_INDEXED_ARGUMENTS *draw_arugment = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
+       draw_arugment->BaseVertex = BaseVertexLocation;
+       draw_arugment->IndexCount = IndexCountPerInstance;
+@@ -1908,6 +1951,7 @@ public:
+     auto max_object_threadgroups = max_object_threadgroups_;
+     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
+       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
++        if (enc.gs_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+         auto [buffer, buffer_offset] = enc.access<true>(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+   
+@@ -1939,6 +1983,7 @@ public:
+ 
+     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
+       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
++        if (enc.gs_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+         auto [buffer, buffer_offset] = enc.access<true>(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+   
+@@ -1971,6 +2016,7 @@ public:
+     auto max_object_threadgroups = max_object_threadgroups_;
+     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
+       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
++        if (enc.tess_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+         auto [buffer, buffer_offset] = enc.access<true>(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+   
+@@ -2005,6 +2051,7 @@ public:
+ 
+     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
+       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
++        if (enc.tess_pso_failed) return;   /* madeira-bcd tess-pso-failed-v1: no mesh pipeline for this draw */
+         auto [buffer, buffer_offset] = enc.access<true>(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+   
+@@ -5131,8 +5178,11 @@ public:
+       pso->GetPipeline(&GraphicsPipeline); // may block
+       enc.tess_num_output_control_point_element = GraphicsPipeline.NumControlPointOutputElement;
+       enc.tess_threads_per_patch = GraphicsPipeline.ThreadsPerPatch;
+-      if (!GraphicsPipeline.PipelineState)
++      enc.tess_pso_failed = !GraphicsPipeline.PipelineState;   /* madeira-bcd tess-pso-failed-v1 */
++      if (!GraphicsPipeline.PipelineState) {
++        madeira_mesh_pso_missing("tessellation");
+         return;
++      }
+       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+       cmd.type = WMTRenderCommandSetPSO;
+       cmd.pso = GraphicsPipeline.PipelineState;
+@@ -5177,8 +5227,11 @@ public:
+       render_encoder->use_geometry = 1;
+       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
+       pso->GetPipeline(&GraphicsPipeline); // may block
+-      if (!GraphicsPipeline.PipelineState)
++      enc.gs_pso_failed = !GraphicsPipeline.PipelineState;   /* madeira-bcd tess-pso-failed-v1 */
++      if (!GraphicsPipeline.PipelineState) {
++        madeira_mesh_pso_missing("geometry");
+         return;
++      }
+       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+       cmd.type = WMTRenderCommandSetPSO;
+       cmd.pso = GraphicsPipeline.PipelineState;
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 3cb10ab..bbbc9fd 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include "com/com_guid.hpp"
+ #include "d3d11_fence.hpp"
+ #include "d3d11_input_layout.hpp"
+@@ -31,8 +32,74 @@
+ #include "d3d11_4.h"
+ #include "util_win32_compat.h"
+ 
++#include <cstdio>
++#include "util_env.hpp"
++
+ namespace dxmt {
+ 
++/* madeira-bcd: render target views on a buffer (round 620: Need for Speed: The Run, Frostbite 2; Discord 2026-10-28, FRGCNV).
++ * DXMT has no render target view on a buffer and answers E_INVALIDARG; the game then stops with its "DirectX error" box.
++ * DXVK answered S_OK and no view for a buffer from 2018 until 2026-08 (Battlefield 3 and 4). env.MADEIRA_BUFFER_RTV_EMPTY = 1
++ * (or d3d11.bufferRtvEmpty=1) does the same here; off by default. Every failed view is logged as [rtv-fail]. */
++namespace {
++
++bool MadeiraBufferRtvEmpty() {
++  static const bool on = [] {
++    const std::string env_v = env::getEnvVar("MADEIRA_BUFFER_RTV_EMPTY");
++    if (!env_v.empty())
++      return env_v != "0";
++    return Config::getInstance().getOption<int>("d3d11.bufferRtvEmpty", 0) > 0;
++  }();
++  return on;
++}
++
++void MadeiraLogRtvFailure(ID3D11Resource *pResource, const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc, HRESULT hr, bool empty) {
++  static std::atomic<unsigned> failures{0};
++  unsigned n = ++failures;
++  if (n > 8 && (n & (n - 1)))
++    return;
++  D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++  char res[200] = "no resource";
++  if (pResource) {
++    pResource->GetType(&dim);
++    auto common = static_cast<D3D11ResourceCommon *>(pResource);
++    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
++      D3D11_BUFFER_DESC d = {};
++      common->GetDesc(&d);
++      snprintf(res, sizeof res, "resource=buffer bytes=%u usage=%u bind=0x%x misc=0x%x stride=%u", d.ByteWidth,
++               (unsigned)d.Usage, d.BindFlags, d.MiscFlags, d.StructureByteStride);
++    } else if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++      D3D11_TEXTURE2D_DESC d = {};
++      common->GetDesc(&d);
++      snprintf(res, sizeof res, "resource=tex2d %ux%u format=%u mips=%u array=%u samples=%u usage=%u bind=0x%x misc=0x%x",
++               d.Width, d.Height, (unsigned)d.Format, d.MipLevels, d.ArraySize, d.SampleDesc.Count, (unsigned)d.Usage,
++               d.BindFlags, d.MiscFlags);
++    } else {
++      snprintf(res, sizeof res, "resource=dimension%u", (unsigned)dim);
++    }
++  }
++  char view[128] = "view=whole resource";
++  if (pDesc) {
++    if (pDesc->ViewDimension == D3D11_RTV_DIMENSION_BUFFER)
++      snprintf(view, sizeof view, "view format=%u dimension=buffer first=%u count=%u", (unsigned)pDesc->Format,
++               pDesc->Buffer.FirstElement, pDesc->Buffer.NumElements);
++    else
++      snprintf(view, sizeof view, "view format=%u dimension=%u", (unsigned)pDesc->Format, (unsigned)pDesc->ViewDimension);
++  }
++  char code[48];
++  if (hr == E_INVALIDARG)
++    snprintf(code, sizeof code, "E_INVALIDARG");
++  else
++    snprintf(code, sizeof code, "0x%08x", (unsigned)hr);
++  const char *what = empty ? " -> S_OK with no view (env.MADEIRA_BUFFER_RTV_EMPTY)"
++                     : dim == D3D11_RESOURCE_DIMENSION_BUFFER
++                         ? " (DXMT has no render target view on a buffer; env.MADEIRA_BUFFER_RTV_EMPTY = 1 answers S_OK and no view, as DXVK did)"
++                         : "";
++  ERR("[rtv-fail] #", n, " CreateRenderTargetView ", code, " ", res, " ", view, what);
++}
++
++} // namespace
++
+ /* ============================ ml652 BC FORMAT CENSUS ============================
+  * Read-only. Changes NO behaviour on any device — it exists to turn "implement
+  * BCn" into a specific, much smaller format set.
+@@ -288,6 +355,17 @@ public:
+     if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED)
+       return E_INVALIDARG; // not supported yet
+ 
++    /* madeira-bcd: texture limit (night round 2026-11-11, G10 S9): Direct3D 11 refuses a 1D texture over 16384 texels or 2048 slices with E_INVALIDARG;
++     * Metal aborts the process on it. */
++    if (pDesc->Width > 16384u || pDesc->ArraySize > 2048u) {
++      static std::atomic<unsigned> refused{0};
++      unsigned n = ++refused;
++      if (n <= 8 || !(n & (n - 1)))
++        ERR("[dxmt-tex-limit] CreateTexture1D refused ", pDesc->Width, " array=", pDesc->ArraySize, " mips=", pDesc->MipLevels,
++            " format=", (unsigned)pDesc->Format, " bind=0x", str::format(std::hex, pDesc->BindFlags), " misc=0x", str::format(std::hex, pDesc->MiscFlags));
++      return E_INVALIDARG;
++    }
++
+     try {
+       switch (pDesc->Usage) {
+       case D3D11_USAGE_DEFAULT:
+@@ -1035,6 +1113,27 @@ public:
+     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
+       return E_INVALIDARG; // not supported yet
+ 
++    /* madeira-bcd: texture limit (night round 2026-11-11, G10 S9: The Witness, Tomb Raider, Transformers, Danganronpa): Direct3D 11 refuses a 2D texture
++     * over 16384 texels in a dimension or 2048 slices with E_INVALIDARG; Metal aborts the process on it. prev= are the last three
++     * requests that passed (the origin of the garbage sizes is not known: 0x80000000 + n, a window left at CW_USEDEFAULT is the suspect). */
++    {
++      static std::atomic<uint64_t> prev_sizes[3];
++      static std::atomic<unsigned> prev_count{0};
++      if (pDesc->Width > 16384u || pDesc->Height > 16384u || pDesc->ArraySize > 2048u) {
++        static std::atomic<unsigned> refused{0};
++        unsigned n = ++refused;
++        if (n <= 8 || !(n & (n - 1))) {
++          unsigned p = prev_count.load();
++          uint64_t a = prev_sizes[(p + 0) % 3], b = prev_sizes[(p + 1) % 3], c = prev_sizes[(p + 2) % 3];
++          ERR("[dxmt-tex-limit] CreateTexture2D refused ", pDesc->Width, "x", pDesc->Height, " array=", pDesc->ArraySize, " mips=", pDesc->MipLevels,
++              " format=", (unsigned)pDesc->Format, " bind=0x", str::format(std::hex, pDesc->BindFlags), " misc=0x", str::format(std::hex, pDesc->MiscFlags),
++              " prev=", (uint32_t)(a >> 32), "x", (uint32_t)a, ",", (uint32_t)(b >> 32), "x", (uint32_t)b, ",", (uint32_t)(c >> 32), "x", (uint32_t)c);
++        }
++        return E_INVALIDARG;
++      }
++      prev_sizes[prev_count++ % 3] = ((uint64_t)pDesc->Width << 32) | pDesc->Height;
++    }
++
+     BCCensusRecord(pDesc, pInitialData);   /* ml652: read-only, no behaviour change */
+ 
+     try {
+@@ -1073,6 +1172,17 @@ public:
+     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
+       return E_INVALIDARG; // not supported yet
+ 
++    /* madeira-bcd: texture limit (night round 2026-11-11, G10 S9): Direct3D 11 refuses a 3D texture over 2048 texels in a dimension with E_INVALIDARG;
++     * Metal aborts the process on it. */
++    if (pDesc->Width > 2048u || pDesc->Height > 2048u || pDesc->Depth > 2048u) {
++      static std::atomic<unsigned> refused{0};
++      unsigned n = ++refused;
++      if (n <= 8 || !(n & (n - 1)))
++        ERR("[dxmt-tex-limit] CreateTexture3D refused ", pDesc->Width, "x", pDesc->Height, "x", pDesc->Depth, " mips=", pDesc->MipLevels,
++            " format=", (unsigned)pDesc->Format, " bind=0x", str::format(std::hex, pDesc->BindFlags), " misc=0x", str::format(std::hex, pDesc->MiscFlags));
++      return E_INVALIDARG;
++    }
++
+     try {
+       switch (pDesc->Usage) {
+       case D3D11_USAGE_DEFAULT:
+@@ -1139,13 +1249,24 @@ public:
+       ID3D11RenderTargetView1 **ppRTView) override {
+     InitReturnPtr(ppRTView);
+ 
+-    if (!pResource)
++    if (!pResource) {
++      MadeiraLogRtvFailure(nullptr, pDesc, E_INVALIDARG, false);   /* madeira-bcd: render target views on a buffer */
+       return E_INVALIDARG;
++    }
+ 
+     if (!ppRTView)
+       return S_FALSE;
+ 
+-    return static_cast<D3D11ResourceCommon *>(pResource)->CreateRenderTargetView(pDesc, ppRTView);
++    HRESULT hr = static_cast<D3D11ResourceCommon *>(pResource)->CreateRenderTargetView(pDesc, ppRTView);
++    if (FAILED(hr)) {
++      D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++      pResource->GetType(&dim);
++      const bool empty = dim == D3D11_RESOURCE_DIMENSION_BUFFER && MadeiraBufferRtvEmpty();
++      MadeiraLogRtvFailure(pResource, pDesc, hr, empty);
++      if (empty)
++        return S_OK;   /* *ppRTView is still nullptr (InitReturnPtr) */
++    }
++    return hr;
+   }
+ 
+   HRESULT STDMETHODCALLTYPE CreateQuery1(const D3D11_QUERY_DESC1 *desc,
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 0d23b04..099837f 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -10,6 +10,8 @@
+ #include "dxgi_resource.hpp"
+ #include "dxmt_resource_binding.hpp"
+ #include "log/log.hpp"
++#include "util_env.hpp"   /* madeira-bcd: views hold their resource privately */
++#include <atomic>
+ #include "../d3d10/d3d10_buffer.hpp"
+ #include "../d3d10/d3d10_texture.hpp"
+ #include "../d3d10/d3d10_view.hpp"
+@@ -354,6 +356,21 @@ struct tag_unordered_access_view {
+   using D3D10_IMPL = ImaginaryD3D10UnorderedAccessView;
+ };
+ 
++/* madeira-bcd: views hold their resource privately (night round 2026-11-11, Hatred PKJ7ZW): env.MADEIRA_VIEW_PRIVATE_REF = 1; off by default.
++ * Unreal Engine 4.10 checks that its back buffer has exactly one reference before a resize; DXMT's views counted as public ones. */
++inline bool MadeiraViewPrivateRefOn() {
++  static const bool on = [] {
++    const std::string env_v = env::getEnvVar("MADEIRA_VIEW_PRIVATE_REF");
++    return !env_v.empty() && env_v != "0";
++  }();
++  return on;
++}
++
++inline unsigned MadeiraViewRefLogCount() {
++  static std::atomic<unsigned> logged{0};
++  return ++logged;
++}
++
+ template <typename tag, typename... Base>
+ class TResourceViewBase
+     : public MTLD3D11DeviceChild<typename tag::COM_IMPL, Base...> {
+@@ -365,6 +382,32 @@ public:
+     if (pDesc) {
+       desc = *pDesc;
+     }
++    /* madeira-bcd: views hold their resource privately: the public reference `resource` just took becomes a private one (see MadeiraViewPrivateRefOn) */
++    if constexpr (requires(typename tag::RESOURCE_IMPL *r) { r->AddRefPrivate(); r->ReleasePrivate(); r->GetPrivateRefCount(); }) {
++      if (MadeiraViewPrivateRefOn() && resource) {
++        resource->AddRefPrivate();
++        ULONG public_after = resource->Release();
++        priv_ = true;
++        unsigned n = MadeiraViewRefLogCount();
++        if (n <= 6) {
++          const char *kind = std::is_same_v<typename tag::COM, ID3D11ShaderResourceView> ? "SRV"
++                             : std::is_same_v<typename tag::COM, ID3D11UnorderedAccessView> ? "UAV"
++                             : std::is_same_v<typename tag::COM, ID3D11RenderTargetView> ? "RTV" : "DSV";
++          ERR("[view-ref] madeira-bcd #", n, " kind=", kind, " resource=", (const void *)resource.ptr(), " public=", public_after + 1, "->",
++              public_after, " private=", resource->GetPrivateRefCount());
++        }
++      }
++    }
++  }
++
++  ~TResourceViewBase() {
++    /* madeira-bcd: views hold their resource privately: give the public reference back before the Com<> member releases it */
++    if constexpr (requires(typename tag::RESOURCE_IMPL *r) { r->AddRefPrivate(); r->ReleasePrivate(); r->GetPrivateRefCount(); }) {
++      if (priv_) {
++        resource->AddRef();
++        resource->ReleasePrivate();
++      }
++    }
+   }
+ 
+   template <std::size_t n> HRESULT ResolveBase(REFIID riid, void **ppvObject) {
+@@ -435,6 +478,7 @@ protected:
+   strong ref to resource
+   */
+   Com<typename tag::RESOURCE_IMPL> resource;
++  bool priv_ = false;   /* madeira-bcd: views hold their resource privately: `resource` holds a private reference, not a public one */
+ };
+ 
+ #pragma region Resource Factory
+diff --git a/src/d3d11/d3d11_state_object.cpp b/src/d3d11/d3d11_state_object.cpp
+index 8fff1ae..428c057 100644
+--- a/src/d3d11/d3d11_state_object.cpp
++++ b/src/d3d11/d3d11_state_object.cpp
+@@ -5,6 +5,7 @@
+ #include "dxmt_sampler.hpp"
+ #include "log/log.hpp"
+ #include "../d3d10/d3d10_state_object.hpp"
++#include <algorithm>
+ 
+ namespace dxmt {
+ 
+@@ -716,7 +717,7 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
+ 
+   // Anisotropy
+   if (D3D11_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter)) {
+-    info.max_anisotroy = desc.MaxAnisotropy;
++    info.max_anisotroy = std::clamp(desc.MaxAnisotropy, 1u, 16u);
+   } else {
+     info.max_anisotroy = 1;
+   }
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index aeb3673..9a009a5 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -997,11 +997,25 @@ public:
+ 
+   HRESULT
+   STDMETHODCALLTYPE
+-  SetRotation(DXGI_MODE_ROTATION Rotation) final { IMPLEMENT_ME; };
++  SetRotation(DXGI_MODE_ROTATION Rotation) final {
++    /* madeira-bcd: d11-swapchain-rotation (night round 2026-11-11, Wesnoth CF2N9T): SDL2's Direct3D 11 renderer calls this after CreateSwapChain;
++     * IMPLEMENT_ME aborted the process. A desktop swap chain has the identity rotation only. */
++    const bool identity = Rotation == DXGI_MODE_ROTATION_UNSPECIFIED || Rotation == DXGI_MODE_ROTATION_IDENTITY;
++    static std::atomic<unsigned> madeira_rotation_calls{0};
++    if (++madeira_rotation_calls <= 4)
++      Logger::info(str::format("[swapchain-rotation] madeira-bcd: SetRotation(", (unsigned)Rotation, ") -> ", identity ? "S_OK" : "DXGI_ERROR_INVALID_CALL"));
++    return identity ? S_OK : DXGI_ERROR_INVALID_CALL;
++  };
+ 
+   HRESULT
+   STDMETHODCALLTYPE
+-  GetRotation(DXGI_MODE_ROTATION *pRotation) final { IMPLEMENT_ME; };
++  GetRotation(DXGI_MODE_ROTATION *pRotation) final {
++    /* madeira-bcd: d11-swapchain-rotation: the identity rotation, as a desktop swap chain reports it */
++    if (!pRotation)
++      return E_INVALIDARG;
++    *pRotation = DXGI_MODE_ROTATION_IDENTITY;
++    return S_OK;
++  };
+ 
+   HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
+     IMPLEMENT_ME
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index a57a5aa..7c80b40 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -394,8 +394,21 @@ public:
+         continue;
+ 
+       // Skip modes with incompatible formats
+-      if (devMode.bitsPerPixel != GetMonitorFormatBpp(EnumFormat))
+-        continue;
++      if (devMode.bitsPerPixel != GetMonitorFormatBpp(EnumFormat)) {
++        /* madeira-bcd: mode list any bpp (night round 2026-11-11, Crash Bandicoot N. Sane Trilogy): opt-in, env.DXMT_MODE_LIST_ANY_BPP = 1. */
++        static const bool anyBpp = [] {
++          const std::string v = env::getEnvVar("DXMT_MODE_LIST_ANY_BPP");
++          return !v.empty() && v != "0";
++        }();
++        if (!anyBpp)
++          continue;
++        static std::atomic<unsigned> admitted{0};
++        unsigned an = admitted.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (an <= 4)
++          Logger::warn(str::format("[dxgi-modes] madeira-bcd any-bpp #", an, ": format ", unsigned(EnumFormat), " wants ",
++              GetMonitorFormatBpp(EnumFormat), " bpp, the monitor's ", devMode.width, "x", devMode.height, " mode has ",
++              devMode.bitsPerPixel, ": listed"));
++      }
+ 
+       if (pDesc != nullptr) {
+         DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index dae3218..fa8d85e 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -882,6 +882,10 @@ public:
+ 
+   uint32_t tess_num_output_control_point_element;
+   uint32_t tess_threads_per_patch;
++  /* madeira-bcd tess-pso-failed-v1 (round 626; tools/patch-dxmt-tess-pso-failed.py): the last tessellation / geometry mesh pipeline
++   * this context set did not compile; the mesh draws of that kind that follow are dropped (d3d11_context_impl.cpp). */
++  bool tess_pso_failed = false;
++  bool gs_pso_failed = false;
+ 
+   EmulatedCommandContext emulated_cmd;
+   ClearRenderTargetContext clear_rt_cmd;
+diff --git a/src/util/wsi_window_headless.cpp b/src/util/wsi_window_headless.cpp
+index c4b1ded..6a2a4a5 100644
+--- a/src/util/wsi_window_headless.cpp
++++ b/src/util/wsi_window_headless.cpp
+@@ -59,6 +59,25 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
+ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
+                          DXMTWindowState *pState,
+                          [[maybe_unused]] bool modeSwitch) {
++  /* madeira-bcd: [wsi-fullscreen] Windows' DXGI covers the output with the window of a swapchain
++   * that goes fullscreen; this layer only said yes, so a program that makes a tiny window and
++   * leaves the sizing to DXGI (American Truck Simulator: 132x38 around a 1024x768 picture) kept
++   * it. A window whose client area is under 160x120 gets the monitor's rectangle; any other
++   * window is left as it is. */
++  RECT client = {}, mon = {};
++  if (hWindow && ::GetClientRect(hWindow, &client) &&
++      client.right - client.left < 160 && client.bottom - client.top < 120 &&
++      (getDesktopCoordinates(hMonitor, &mon) || getDesktopCoordinates(getDefaultMonitor(), &mon)) &&
++      mon.right - mon.left >= 320 && mon.bottom - mon.top >= 200) {
++    BOOL ok = ::SetWindowPos(hWindow, nullptr, mon.left, mon.top, mon.right - mon.left,
++                             mon.bottom - mon.top,
++                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
++    static int said = 0;
++    if (said++ < 4)
++      WARN("[wsi-fullscreen] a fullscreen swapchain's window has a ", (int)(client.right - client.left),
++           "x", (int)(client.bottom - client.top), " client area; sized to the monitor ",
++           (int)(mon.right - mon.left), "x", (int)(mon.bottom - mon.top), " ok=", (int)ok);
++  }
+   return true;
+ }
+ 
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 8592f89..1f4c268 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1197,6 +1197,25 @@ _MTLDevice_newTexture(void *obj) {
+   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+   fill_texture_descriptor(desc, info);
+ 
++  /* madeira-bcd: mtl-tex-fail (night round 2026-11-11, G10 S9: The Witness, Tomb Raider, Transformers, Danganronpa): Metal's descriptor validation
++   * aborts the process (SIGABRT, not an exception) on a size beyond the device's limit; refuse the sizes no Apple GPU accepts. */
++  if (desc.textureType != MTLTextureTypeTextureBuffer &&
++      (desc.width > 32768 || desc.height > 32768 || desc.depth > 2048 || desc.arrayLength > 2048)) {
++    static unsigned madeira_tex_refused;
++    unsigned n = __atomic_add_fetch(&madeira_tex_refused, 1, __ATOMIC_RELAXED);
++    if (n <= 8 || (n & (n - 1)) == 0)
++      fprintf(stderr, "[mtl-tex-fail] madeira-bcd #%u: refused %lux%lux%lu (array %lu, mips %lu, format %lu, type %lu, usage 0x%lx): "
++              "Metal aborts on a size above every Apple GPU's limit (32768; 3D depth and array length 2048)\n",
++              n, (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.depth, (unsigned long)desc.arrayLength,
++              (unsigned long)desc.mipmapLevelCount, (unsigned long)desc.pixelFormat, (unsigned long)desc.textureType,
++              (unsigned long)desc.usage);
++    params->ret = 0;
++    info->gpu_resource_id = 0;
++    info->mach_port = 0;
++    [desc release];
++    return STATUS_SUCCESS;
++  }
++
+   id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
+   params->ret = (obj_handle_t)ret;
+   info->gpu_resource_id = [ret gpuResourceID]._impl;
