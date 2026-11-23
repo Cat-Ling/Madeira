@@ -5623,7 +5623,7 @@ struct LibraryHUD: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
-            let externalCompanion = external.isActive && !MetalBackedView.desktopMode && external.phoneMode == .companion
+            let externalCompanion = external.isActive && !HardwareInput.desktopMode && external.phoneMode == .companion
             ZStack(alignment: .topLeading) {
                 if model.startingScreen, !externalCompanion, let entry = model.startingEntry {
                     // An opaque base first, so the desktop never shows through while the
