@@ -995,7 +995,13 @@ final class LibraryModel: ObservableObject {
         publicationLog.append(LibraryPublication(revision: revision, kind: kind, ids: ids))
         if publicationLog.count > 32 { publicationLog.removeFirst(publicationLog.count - 32) }
     }
-    @Published var current: UUID?
+    @Published var current: UUID? {
+        didSet {
+            if (oldValue == nil) != (current == nil) {
+                MetalBackedView.refreshDisplayMode(reason: "library-session")
+            }
+        }
+    }
     @Published var activeEntry: LibraryEntry?
     @Published var menu = false
     @Published var performance = false
@@ -5668,6 +5674,7 @@ struct LibraryHUD: View {
             }
             .preferredColorScheme(.dark)
         }.ignoresSafeArea()
+        .overlay(alignment: .bottom) { AssistiveTouchHintBanner().padding(.bottom, 24) }
         .onAppear { model.saveCurrentProfile() }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)

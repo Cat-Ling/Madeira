@@ -133,13 +133,20 @@ documented for [Citrix's generic mouse input](https://docs.citrix.com/en-us/citr
 
 **iPhone:** pointer devices are routed only through AssistiveTouch (Settings >
 Accessibility > Touch > AssistiveTouch > On, then Devices). If a mouse is
-enumerated but reports nothing for 10 s, the app shows this path once. With
-AssistiveTouch, a click also arrives as a synthesised finger touch at the
-AssistiveTouch cursor, which would snap the program's cursor there. While the
-mouse is in use (a GCMouse delta in the last 2 s), touches on the game view
-with no contact patch, or within 50 ms of a GCMouse button change, are
-dropped. The decision is retained through release/cancellation, so a touch
-admitted on press cannot lose its release when the raw mouse becomes active.
+enumerated but reports nothing for 10 s, the app shows this path once (both in
+the pointer settings panel and as a non-interactive banner in the library
+session HUD); toggling AssistiveTouch on mid-run re-inventories `GCMouse`
+immediately without restarting Madeira. With AssistiveTouch, a primary click
+also arrives as a synthesised finger touch at the AssistiveTouch cursor, which
+would snap the program's cursor there. Right, middle, and side buttons (`X1`/`X2`),
+as well as clicks during mouse-look (hidden cursor or relative mode), bypass the
+60 ms click-focus wait and are delivered immediately; primary clicks that are
+released inside that window are held for at least one frame (16 ms) so polling
+games do not miss fast taps. While the mouse is in use (a GCMouse delta in the
+last 2 s), touches on the game view with no contact patch, or within 50 ms of a
+GCMouse button change, are dropped. The decision is retained through
+release/cancellation, so a touch admitted on press cannot lose its release when
+the raw mouse becomes active.
 The first 30 classifications are logged. Set
 `"ignoreTouchesWithMouse": false` in `Documents/madeira-input.json` to turn the
 filter off. The on-screen touch controls are not filtered. AssistiveTouch's own

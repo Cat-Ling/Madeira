@@ -366,6 +366,22 @@ app audio to the controller and the device sounds silent while the audio engine
 reports healthy signal levels. This is system routing, not a Madeira audio fault:
 unplug the cable or pair the controller over Bluetooth.
 
+## Device rumble and screen sharing
+
+When player 1 is the on-screen touch gamepad or a phone-attached controller
+without its own haptic motors (such as Backbone One), slot 0's rumble plays on
+the device's Taptic Engine. Physical controllers with built-in haptics use their
+own `GCController.haptics` motors instead, following the locality ladder
+left+right handles -> `handles` -> `default`, with dynamic sharpness blending on
+single-engine pads.
+
+Device rumble is blocked and stopped immediately whenever the screen is being
+mirrored, captured (including AirPlay screen mirroring), or driving an external
+display (`UIScreen.screens.count > 1`, `isCaptured`, or `mirroredScreen != nil`),
+and on-screen touch-control tap haptics are suppressed under the same condition.
+Set `env.MADEIRA_DEVICE_RUMBLE = 0` in `madeira.cfg` to disable device rumble
+altogether.
+
 ## Rollback and scope
 
 Set `env.MADEIRA_XINPUT = 0` in Documents/madeira.cfg and restart to disable the
@@ -386,6 +402,7 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | `MADEIRA_PAD_MODE` | XInput | `hid` / `dualsense` / `generic`: player 1 as a HID controller (see above) |
 | `MADEIRA_HIDPAD_XINPUT` | **off** | `1`: in HID mode, player 1 stays an XInput pad as well |
 | `MADEIRA_PAD_OUTPUT` | on | `0`: no rumble/trigger/lightbar output to the pad; `hid` / `xinput`: only that half |
+| `MADEIRA_DEVICE_RUMBLE` | on | `0`: never rumble the device's own Taptic Engine for touch or motorless attached pads |
 | `MADEIRA_XINPUT_BATTERY` | on | `0`: XInput reports an unknown battery and no wireless flag (ml2170) |
 | `MADEIRA_WGI_HOST_PADS` | on | `0`: Windows.Gaming.Input lists no controllers (ml2171) |
 | `MADEIRA_XINPUT_ENABLE_FOREGROUND` | on | `0`: a game's XInputEnable(FALSE) zeroes the pad even while its window is in front (ml2115) |

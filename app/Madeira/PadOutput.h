@@ -24,4 +24,7 @@ void madeira_pad_output_set_slot(int slot, GCController *_Nullable controller);
 /// adaptive triggers go off. 1 re-applies what the game last asked for.
 void madeira_pad_output_set_active(int active);
 
+/// Slot 0 is the on-screen touch gamepad, which may rumble the device itself.
+void madeira_pad_output_set_touch(int active);
+
 NS_ASSUME_NONNULL_END

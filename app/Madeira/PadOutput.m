@@ -19,13 +19,18 @@
 // closest mapping, not the DualSense protocol:
 //  - rumble -> CoreHaptics: one continuous haptic event per handle (left =
 //    the large, low-frequency motor; right = the small, high-frequency one)
-//    from GCController.haptics, its intensity following the motor byte;
+//    from GCController.haptics (locality ladder: left+right handles -> handles
+//    -> default), with sharpness blending on single-engine pads;
+//  - device rumble -> the device's own Taptic Engine when slot 0 is the touch
+//    gamepad or an attached controller without haptics, disabled whenever the
+//    screen is mirrored, captured, or on an external display;
 //  - trigger effects -> GCDualSenseAdaptiveTrigger modes
 //    (Winios/WiniosPadEffects.h decides which);
 //  - lightbar -> GCController.light.color; player LEDs -> playerIndex.
 // Not reachable from an app: audio-based haptics, speaker, headset, mic and
 // its LED, LED brightness and fades.
 #import "PadOutput.h"
+#import <UIKit/UIKit.h>
 #import <GameController/GameController.h>
 #import <CoreHaptics/CoreHaptics.h>
 #import <objc/message.h>
@@ -35,6 +40,7 @@
 #include <string.h>
 #include "Winios/WiniosGamepad.h"
 #include "Winios/WiniosPadEffects.h"
+#include "../../build/madeira_cfg.h"
 
 #define PAD_SLOTS WINIOS_GAMEPAD_MAX
 #define PAD_LOG_LIMIT 8
@@ -63,6 +69,7 @@ static void on_main(dispatch_block_t block)
 
 @interface MadeiraRumble : NSObject
 - (instancetype)initWithController:(GCController *)controller slot:(int)slot;
+- (instancetype)initDevice;
 - (void)setLow:(float)low high:(float)high;
 - (void)stop;
 - (void)teardown;
@@ -71,6 +78,8 @@ static void on_main(dispatch_block_t block)
 @implementation MadeiraRumble {
     __weak GCController *_controller;
     int _slot;
+    BOOL _device;
+    GCHapticsLocality _single;
     int _channels;              // 0 not looked yet, 2 left+right handles, 1 one engine, -1 no haptics
     CHHapticEngine *_engine[2];
     id<CHHapticPatternPlayer> _player[2];   // plain players: push restarts them before their event ends
@@ -78,6 +87,7 @@ static void on_main(dispatch_block_t block)
     BOOL _playing[2];
     float _want[2];             // per engine: 0 left/low (or the only one), 1 right/high
     float _sent[2];
+    float _sharp, _sharpSent;
     unsigned int _failures;     // failed engine/player set-ups in a row; 0 again once one works
     unsigned int _logged, _losses, _strikes;
     CFAbsoluteTime _retryAt;    // no new set-up before this (back-off after a failure)
@@ -89,6 +99,20 @@ static void on_main(dispatch_block_t block)
         _controller = controller;
         _slot = slot;
         _sent[0] = _sent[1] = -1;
+        _sharp = 0.5f;
+        _sharpSent = -1;
+    }
+    return self;
+}
+
+- (instancetype)initDevice
+{
+    if ((self = [super init])) {
+        _device = YES;
+        _slot = 0;
+        _sent[0] = _sent[1] = -1;
+        _sharp = 0.5f;
+        _sharpSent = -1;
     }
     return self;
 }
@@ -96,15 +120,25 @@ static void on_main(dispatch_block_t block)
 - (BOOL)lookUpChannels
 {
     if (_channels) return _channels > 0;
+    if (_device) {
+        _channels = CHHapticEngine.capabilitiesForHardware.supportsHaptics ? 1 : -1;
+        fprintf(stderr, "[hidpad-out] device haptics: %s\n",
+                _channels > 0 ? "Taptic Engine" : "unavailable");
+        return _channels > 0;
+    }
     GCDeviceHaptics *haptics = _controller.haptics;
     NSSet<GCHapticsLocality> *where = haptics.supportedLocalities;
     if (!haptics) _channels = -1;
     else if ([where containsObject:GCHapticsLocalityLeftHandle] && [where containsObject:GCHapticsLocalityRightHandle])
         _channels = 2;
-    else _channels = 1;
+    else {
+        _channels = 1;
+        _single = [where containsObject:GCHapticsLocalityHandles] ? GCHapticsLocalityHandles : GCHapticsLocalityDefault;
+    }
     fprintf(stderr, "[hidpad-out] ml2107 slot %d haptics: %s (localities %s)\n", _slot,
             _channels == 2 ? "left + right handle engines" :
-            _channels == 1 ? "one engine (default locality)" : "none, this pad gets no rumble",
+            _channels == 1 ? (_single == GCHapticsLocalityHandles ? "one engine (handles locality)" : "one engine (default locality)") :
+            "none, this pad gets no rumble",
             where.count ? [where.allObjects componentsJoinedByString:@","].UTF8String : "none");
     return _channels > 0;
 }
@@ -133,6 +167,7 @@ static void on_main(dispatch_block_t block)
                 _failures < RUMBLE_GIVE_UP ? "; trying again later" : "");
     if (_channels == 2 && _failures == 2 && !_player[0] && !_player[1]) {
         _channels = 1;
+        _single = GCHapticsLocalityDefault;
         _want[0] = fmaxf(_want[0], _want[1]);
         _want[1] = 0;
         fprintf(stderr, "[hidpad-out] ml2107 slot %d haptics: the per-handle engines keep failing; "
@@ -153,6 +188,7 @@ static void on_main(dispatch_block_t block)
     _player[i] = nil;
     _playing[i] = NO;
     _sent[i] = -1;
+    if (i == 0) _sharpSent = -1;
     /* A pad that keeps dropping its engine: leave it alone. iOS stops the engines
      * when the app goes to the background or audio is interrupted; those do not count. */
     if (reason != CHHapticEngineStoppedReasonApplicationSuspended
@@ -165,14 +201,27 @@ static void on_main(dispatch_block_t block)
 {
     if (_player[i]) return _player[i];
     if (_failures >= RUMBLE_GIVE_UP || CFAbsoluteTimeGetCurrent() < _retryAt) return nil;
-    GCDeviceHaptics *haptics = _controller.haptics;
-    if (!haptics) return nil;
-    GCHapticsLocality where = _channels == 2 ? (i == 0 ? GCHapticsLocalityLeftHandle : GCHapticsLocalityRightHandle)
-                                             : GCHapticsLocalityDefault;
-    CHHapticEngine *engine = [haptics createEngineWithLocality:where];
-    if (!engine) {
-        [self fail:"createEngineWithLocality" error:nil];
-        return nil;
+    CHHapticEngine *engine = nil;
+    NSString *whereLabel = nil;
+    NSError *error = nil;
+    if (_device) {
+        engine = [[CHHapticEngine alloc] initAndReturnError:&error];
+        whereLabel = @"device";
+        if (!engine) {
+            [self fail:"device engine init" error:error];
+            return nil;
+        }
+    } else {
+        GCDeviceHaptics *haptics = _controller.haptics;
+        if (!haptics) return nil;
+        GCHapticsLocality where = _channels == 2 ? (i == 0 ? GCHapticsLocalityLeftHandle : GCHapticsLocalityRightHandle)
+                                                 : (_single ?: GCHapticsLocalityDefault);
+        engine = [haptics createEngineWithLocality:where];
+        whereLabel = where;
+        if (!engine) {
+            [self fail:"createEngineWithLocality" error:nil];
+            return nil;
+        }
     }
     engine.playsHapticsOnly = YES;
     __weak MadeiraRumble *weakSelf = self;
@@ -187,7 +236,6 @@ static void on_main(dispatch_block_t block)
             [weakSelf engineLost:i engine:weakEngine reason:-1];
         });
     };
-    NSError *error = nil;
     if (![engine startAndReturnError:&error]) {
         [self fail:"engine start" error:error];
         return nil;
@@ -221,23 +269,31 @@ static void on_main(dispatch_block_t block)
         return nil;
     }
     if (_logged++ < 8)
-        fprintf(stderr, "[hidpad-out] ml2107 slot %d haptics ready on %s%s\n", _slot, where.UTF8String,
+        fprintf(stderr, "[hidpad-out] ml2107 slot %d haptics ready on %s%s\n", _slot, whereLabel.UTF8String,
                 _failures ? " after failed attempts" : "");
     _failures = 0;
     _engine[i] = engine;
     _player[i] = player;
     _playing[i] = NO;
     _sent[i] = -1;
+    if (i == 0) _sharpSent = -1;
     return player;
 }
 
-- (void)sendLevel:(float)level to:(id<CHHapticPatternPlayer>)player
+- (void)sendLevel:(float)level index:(int)i to:(id<CHHapticPatternPlayer>)player
 {
-    CHHapticDynamicParameter *intensity =
+    NSMutableArray<CHHapticDynamicParameter *> *params = [NSMutableArray arrayWithObject:
         [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl
                                                         value:level
-                                                 relativeTime:0];
-    [player sendParameters:@[intensity] atTime:CHHapticTimeImmediate error:nil];
+                                                 relativeTime:0]];
+    if (_channels == 1 && i == 0) {
+        float sharp = (_sharp - 0.5f) * 0.4f;
+        [params addObject:[[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticSharpnessControl
+                                                                          value:sharp
+                                                                   relativeTime:0]];
+        _sharpSent = _sharp;
+    }
+    [player sendParameters:params atTime:CHHapticTimeImmediate error:nil];
 }
 
 - (void)push
@@ -248,6 +304,7 @@ static void on_main(dispatch_block_t block)
             if (_playing[i]) [_player[i] stopAtTime:CHHapticTimeImmediate error:nil];
             _playing[i] = NO;
             _sent[i] = 0;
+            if (i == 0) _sharpSent = -1;
             continue;
         }
         id<CHHapticPatternPlayer> player = [self playerFor:i];
@@ -259,7 +316,7 @@ static void on_main(dispatch_block_t block)
         }
         if (!_playing[i]) {
             NSError *error = nil;
-            [self sendLevel:level to:player];
+            [self sendLevel:level index:i to:player];
             if (![player startAtTime:CHHapticTimeImmediate error:&error]) {
                 // Drop this handle's engine: the next try (after the back-off)
                 // builds a fresh one instead of starting a dead player again.
@@ -272,9 +329,9 @@ static void on_main(dispatch_block_t block)
             }
             _playing[i] = YES;
             _startedAt[i] = CFAbsoluteTimeGetCurrent();
-            [self sendLevel:level to:player];
-        } else if (level != _sent[i]) {
-            [self sendLevel:level to:player];
+            [self sendLevel:level index:i to:player];
+        } else if (level != _sent[i] || (_channels == 1 && i == 0 && _sharp != _sharpSent)) {
+            [self sendLevel:level index:i to:player];
         }
         _sent[i] = level;
     }
@@ -289,6 +346,7 @@ static void on_main(dispatch_block_t block)
     } else {
         _want[0] = fmaxf(low, high);
         _want[1] = 0;
+        _sharp = (low + high) > 0.0f ? high / (low + high) : 0.5f;
     }
     [self push];
 }
@@ -300,6 +358,7 @@ static void on_main(dispatch_block_t block)
         _playing[i] = NO;
         _sent[i] = -1;
     }
+    _sharpSent = -1;
 }
 
 - (void)teardown
@@ -318,6 +377,9 @@ static void on_main(dispatch_block_t block)
 
 static GCController *g_slot[PAD_SLOTS];
 static MadeiraRumble *g_rumble[PAD_SLOTS];
+static MadeiraRumble *g_device;
+static int g_touch;
+static int g_device_said;
 static struct winios_hidpad_output g_applied;   // the HID output last applied to slot 0
 static int g_applied_valid;                     // 0: apply everything again next pass
 static int g_triggers_set;                      // a trigger mode other than off is on the pad
@@ -448,10 +510,35 @@ static void apply_hid(GCController *controller, const struct winios_hidpad_outpu
     g_applied_valid = 1;
 }
 
+static BOOL display_shared(void)
+{
+    UIScreen *main = UIScreen.mainScreen;
+    if (main.isCaptured || main.mirroredScreen != nil) return YES;
+    for (UIScreen *s in UIScreen.screens) {
+        if (s != main || s.mirroredScreen != nil) return YES;
+    }
+    return NO;
+}
+
+static int device_rumble_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = madeira_cfg_bool("env.MADEIRA_DEVICE_RUMBLE", 1);
+    return enabled;
+}
+
+static int device_rumble_allowed(void)
+{
+    return device_rumble_enabled() && g_active && !display_shared()
+        && (g_touch || (g_slot[0] && g_slot[0].isAttachedToDevice && !g_slot[0].haptics))
+        && !(g_slot[0] && g_slot[0].haptics);
+}
+
 static void pad_output_apply(void)
 {
     struct winios_hidpad_output out;
     unsigned int reduction;
+    float slot0_low = 0, slot0_high = 0;
     int i;
 
     if (!g_active || (!g_xinput && !g_hid)) return;
@@ -462,7 +549,7 @@ static void pad_output_apply(void)
     for (i = 0; i < PAD_SLOTS; i++) {
         struct winios_gamepad_vibration motors;
         float low = 0, high = 0;
-        if (!g_rumble[i]) continue;
+        if (!g_rumble[i] && i != 0) continue;
         if (g_xinput && winios_gamepad_get_vibration(i, &motors)) {
             low = winios_xinput_level(motors.left);
             high = winios_xinput_level(motors.right);
@@ -471,9 +558,24 @@ static void pad_output_apply(void)
             low = fmaxf(low, winios_rumble_level(out.rumble_left, reduction));
             high = fmaxf(high, winios_rumble_level(out.rumble_right, reduction));
         }
+        if (i == 0) {
+            slot0_low = low;
+            slot0_high = high;
+        }
+        if (!g_rumble[i]) continue;
         if ((low > 0 || high > 0) && g_logged_rumble++ < PAD_LOG_LIMIT)
             fprintf(stderr, "[hidpad-out] ml2107 slot %d rumble low %.2f high %.2f\n", i, low, high);
         [g_rumble[i] setLow:low high:high];
+    }
+    if (device_rumble_allowed()) {
+        if (!g_device) g_device = [[MadeiraRumble alloc] initDevice];
+        [g_device setLow:slot0_low high:slot0_high];
+    } else {
+        [g_device stop];
+        if (display_shared() && (slot0_low > 0 || slot0_high > 0) && !g_device_said) {
+            g_device_said = 1;
+            fprintf(stderr, "[hidpad-out] device rumble off: screen mirrored or external display\n");
+        }
     }
     if (g_hid && g_slot[0]) apply_hid(g_slot[0], &out);
 
@@ -489,15 +591,34 @@ static void pad_output_apply(void)
 void madeira_pad_output_configure(int xinput, int hid)
 {
     on_main(^{
+        static dispatch_once_t once;
         int i;
+        dispatch_once(&once, ^{
+            NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+            void (^onScreenChange)(NSNotification *) = ^(NSNotification *note) {
+                (void)note;
+                if (display_shared()) {
+                    [g_device teardown];
+                    g_device = nil;
+                }
+                pad_output_apply();
+            };
+            for (NSNotificationName name in @[UIScreenDidConnectNotification,
+                                              UIScreenDidDisconnectNotification,
+                                              UIScreenCapturedDidChangeNotification]) {
+                [nc addObserverForName:name object:nil queue:[NSOperationQueue mainQueue] usingBlock:onScreenChange];
+            }
+        });
         g_xinput = !!xinput;
         g_hid = !!hid;
         g_applied_valid = 0;
         winios_gamepad_set_rumble_caps(g_xinput);
         winios_pad_output_set_notify(g_xinput || g_hid ? pad_output_notify : NULL);
         fprintf(stderr, "[hidpad-out] ml2106 session output: xinput-rumble=%d hid=%d\n", g_xinput, g_hid);
-        if (!g_xinput && !g_hid)
+        if (!g_xinput && !g_hid) {
             for (i = 0; i < PAD_SLOTS; i++) [g_rumble[i] stop];
+            [g_device stop];
+        }
         pad_output_apply();
     });
 }
@@ -530,6 +651,17 @@ void madeira_pad_output_set_active(int active)
             return;
         }
         for (i = 0; i < PAD_SLOTS; i++) [g_rumble[i] stop];
+        [g_device stop];
         if (g_hid && g_slot[0]) triggers_off(g_slot[0]);
+    });
+}
+
+void madeira_pad_output_set_touch(int active)
+{
+    on_main(^{
+        if (g_touch == !!active) return;
+        g_touch = !!active;
+        if (!g_touch) [g_device stop];
+        pad_output_apply();
     });
 }

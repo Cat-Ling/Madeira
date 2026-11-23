@@ -803,8 +803,14 @@ final class HardwareInput: ObservableObject {
     private var buttonsPosted = HeldEdges<MouseButton>()
     /// iPhone: presses waiting for the tap that says where they belong.
     private var pendingButtons: [MouseButton: (at: CFTimeInterval, released: Bool)] = [:]
+    private var pressGen: [MouseButton: Int] = [:]
     private var gcButtonSeen = false
     private var buttonRouteTraceCount = 0
+
+    private var programHidesCursor: Bool {
+        (cursorState.reports != 0 && cursorState.shown == 0)
+            || (Self.mouseRoutingEnabled && InputSettings.shared.relative)
+    }
 
     // MARK: cursor and lock state (main thread)
 
@@ -938,6 +944,11 @@ final class HardwareInput: ObservableObject {
         nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.appActive = true
             self?.refreshFocus("app active")
+        }
+        nc.addObserver(forName: UIAccessibility.assistiveTouchStatusDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            let on = UIAccessibility.isAssistiveTouchRunning
+            self?.inventory("assistive-touch \(on ? "on" : "off")")
+            if on { self?.dismissAssistiveTouchHint() }
         }
         // Not on memory warnings: games here run close to the memory limit and
         // get them mid-play, and a key released while still physically held
@@ -1584,11 +1595,16 @@ final class HardwareInput: ObservableObject {
         gcButtonSeen = true
         gcButtonsSeen.insert(b)
         if pressed {
+            pressGen[b, default: 0] &+= 1
             setMouseInUse(true)
             refreshFocus("button")
             if !baseFocused {
                 // nothing: the program does not have focus
             } else if !Self.focusEnabled || pointerLocked || hoverSeen {
+                if mouseFocused { gameButtons.insert(b) }
+            } else if b != .left || programHidesCursor {
+                // AssistiveTouch synthesises taps only for primary clicks, so
+                // secondary buttons and mouse-look clicks skip the 60 ms wait.
                 if mouseFocused { gameButtons.insert(b) }
             } else if let toGame = clickFocus.route(buttonAt: t, now: CACurrentMediaTime()) {
                 if toGame { gameButtons.insert(b) }
@@ -1622,8 +1638,12 @@ final class HardwareInput: ObservableObject {
         gameButtons.insert(b)
         syncButtons()
         if p.released {
-            gameButtons.remove(b)
-            syncButtons()
+            let gen = pressGen[b]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                guard let self, self.pressGen[b] == gen else { return }
+                self.gameButtons.remove(b)
+                self.syncButtons()
+            }
         }
     }
 
@@ -2680,6 +2700,28 @@ struct HardwareInputSettings: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Dismiss")
+        }
+    }
+}
+
+struct AssistiveTouchHintBanner: View {
+    @ObservedObject private var hw = HardwareInput.shared
+
+    var body: some View {
+        if HardwareInput.enabled && hw.assistiveTouchHint {
+            Text("Using a mouse? Turn on AssistiveTouch (Settings > Accessibility > Touch), then reopen Madeira.")
+                .font(.caption)
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.horizontal, 16)
+                .allowsHitTesting(false)
+                .task {
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    HardwareInput.shared.dismissAssistiveTouchHint()
+                }
         }
     }
 }

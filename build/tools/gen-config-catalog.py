@@ -762,6 +762,17 @@ OVERLAY = {
                 "choices": [("", "On (default)"), ("hid", "DualSense output only"), ("xinput", "XInput rumble only"),
                             ("0", "Off")],
                 "sources": ["app/Madeira/GamepadInput.swift", "app/Madeira/PadOutput.m"]},
+    "env.MADEIRA_DEVICE_RUMBLE": {"category": "Controllers", "title": "Device rumble for touch and motorless pads",
+                "kind": "bool", "default": "1",
+                "note": "On (default): plays player 1's rumble on the device's Taptic Engine when using the touch "
+                        "gamepad or an attached controller without motors. Always suppressed while the screen is "
+                        "mirrored, captured, or on an external display. 0: never rumble the device.",
+                "sources": ["app/Madeira/PadOutput.m"]},
+    "env.MADEIRA_EXTERNAL_DISPLAY": {"category": "Windows, display & input", "title": "Dedicated external display output",
+                "kind": "bool", "default": "1",
+                "note": "On (default): moves direct game rendering to a connected AirPlay or HDMI/USB-C display while "
+                        "keeping touch controls and menus on the device. 0: keep rendering on the device screen.",
+                "sources": ["app/Madeira/ContentView.swift"]},
     # ml2170/ml2171: XInput battery and Windows.Gaming.Input host pads (docs/CONTROLLERS.md).
     "env.MADEIRA_XINPUT_BATTERY": {"category": "Controllers", "title": "Controller battery level to XInput",
                 "kind": "bool", "default": "1",

@@ -27,6 +27,7 @@ final class GamepadInput: @unchecked Sendable {
         queue.async { [self] in
             let wasConnected = touchState.connected, wasAccepting = touchState.acceptingInput
             touchState.configure(allowed, acceptingInput: acceptingInput)
+            madeira_pad_output_set_touch(touchState.connected && touchState.acceptingInput ? 1 : 0)
             if wasConnected != touchState.connected || wasAccepting != touchState.acceptingInput {
                 LogStore.shared.log("[touch-xinput] connected=\(touchState.connected ? 1 : 0) accepting=\(acceptingInput ? 1 : 0) controls=\(allowed.count)")
             }
