@@ -180,6 +180,7 @@ else
     echo "ERROR: wine-opengl-winios.patch does not apply cleanly to $WINE_SRC" >&2
     exit 1
 fi
+bash "$REPO_ROOT/build/wine-patches/apply.sh"
 compile_unixlib "$WINE_SRC/dlls/opengl32/unix_wgl.c" "opengl32_wgl" "opengl32" \
     -I"$WINE_SRC/dlls/opengl32"
 compile_unixlib "$WINE_SRC/dlls/opengl32/unix_thunks.c" "opengl32_thunks" "opengl32" \

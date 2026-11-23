@@ -49,7 +49,8 @@
       "tools/check-wine-media-dlls.py",
       "build/wineios-drv/**",
       "build/tftrace/*.c",
-      "patches/wine-opengl-winios.patch"
+      "patches/wine-opengl-winios.patch",
+      "build/wine-patches/**"
     ],
     "outputs": [
       "arm64ec-windows/*",

@@ -1,0 +1,1020 @@
+diff --git a/FEXCore/Source/Interface/Core/CPUID.cpp b/FEXCore/Source/Interface/Core/CPUID.cpp
+index 4d8f297..927dcee 100644
+--- a/FEXCore/Source/Interface/Core/CPUID.cpp
++++ b/FEXCore/Source/Interface/Core/CPUID.cpp
+@@ -448,6 +448,23 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_0h(uint32_t Leaf) const {
+ }
+ 
+ // Processor Info and Features bits
++// cpuid-classic-v2 madeira-bcd (tools/patch-fex-ios-cpuid-classic.py; round 626, value 2 since build 660): env MADEIRA_FEX_CPUID_CLASSIC=1
++// reports CPUID.1:EDX DE and PSE as every real x86 processor does (Burnout Paradise tests EDX bit 2); =2 also reports 1 GB pages
++// in CPUID.80000001h:EDX. Unset or any other value: both leaves as before. Read once. Returns 0, 1 or 2.
++static uint32_t MadeiraCpuidClassic() {
++  static const uint32_t Level = [] {
++    const char* Env = getenv("MADEIRA_FEX_CPUID_CLASSIC");
++    const uint32_t Value = (Env && (Env[0] == '1' || Env[0] == '2') && Env[1] == '\0') ? static_cast<uint32_t>(Env[0] - '0') : 0u;
++    if (Value == 1) {
++      LogMan::Msg::IFmt("[fex-cpuid] MADEIRA_FEX_CPUID_CLASSIC=1: CPUID leaf 1 reports DE and PSE (EDX bits 2 and 3)");
++    } else if (Value == 2) {
++      LogMan::Msg::IFmt("[fex-cpuid] MADEIRA_FEX_CPUID_CLASSIC=2: CPUID leaf 1 reports DE and PSE (EDX bits 2 and 3), leaf 0x80000001 1 GB pages (EDX bit 26)");
++    }
++    return Value;
++  }();
++  return Level;
++}
++
+ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
+   FEXCore::CPUID::FunctionResults Res {};
+ 
+@@ -501,8 +518,8 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_01h(uint32_t Leaf) const {
+ 
+   Res.edx = (1 << 0) |  // FPU
+             (1 << 1) |  // Virtual 8086 mode enhancements
+-            (0 << 2) |  // Debugging extensions
+-            (0 << 3) |  // Page size extension
++            ((MadeiraCpuidClassic() ? 1u : 0u) << 2) |  // Debugging extensions (madeira-bcd: MADEIRA_FEX_CPUID_CLASSIC=1 or 2)
++            ((MadeiraCpuidClassic() ? 1u : 0u) << 3) |  // Page size extension (madeira-bcd: MADEIRA_FEX_CPUID_CLASSIC=1 or 2)
+             (1 << 4) |  // RDTSC supported
+             (1 << 5) |  // MSR supported
+             (1 << 6) |  // PAE
+@@ -1100,7 +1117,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0001h(uint32_t Leaf) con
+             (1 << 23) |                               // MMX
+             (1 << 24) |                               // FXSAVE/FXRSTOR
+             (1 << 25) |                               // FXSAVE/FXRSTOR Optimizations
+-            (0 << 26) |                               // 1 gigabit pages
++            ((MadeiraCpuidClassic() == 2 ? 1u : 0u) << 26) | // 1 gigabit pages (madeira-bcd: MADEIRA_FEX_CPUID_CLASSIC=2)
+             (SUPPORTS_RDTSCP << 27) |                 // RDTSCP
+             (0 << 28) |                               // Reserved
+             (1 << 29) |                               // Long Mode
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 8884ec0..d5034ab 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -874,6 +874,22 @@ extern "C" void FEX_MadeiraIRCapMark(uint64_t GuestRIP);
+ extern "C" void FEX_MadeiraIRCapClear();
+ extern "C" uint64_t FEX_MadeiraIRCapCurrentRIP();
+ 
++// moffs-rip-v1 madeira-bcd (tools/patch-fex-ios-moffs-rip.py, round 630, Unreal Gold): env MADEIRA_FEX_MOFFS_RIP=1 gives MOV moffs
++// (opcodes A0-A3) a guest-RIP entry like every other memory instruction. CanHaveSideEffects knows the GPR/RIP/SIB memory operands
++// but not the literal address of MOV moffs, so the inline self-modifying-code handler resumed in front of such a store and ran the
++// register-only instructions before it twice. The entry emits no host instruction. Unset or any other value: unchanged. Read once.
++static bool MadeiraMoffsRip(const FEXCore::X86Tables::X86InstInfo* TableInfo) {
++  static const bool On = [] {
++    const char* Env = getenv("MADEIRA_FEX_MOFFS_RIP");
++    const bool Value = Env && Env[0] == '1' && Env[1] == '\0';
++    if (Value) {
++      LogMan::Msg::IFmt("[fex-moffs] MADEIRA_FEX_MOFFS_RIP=1: MOV moffs instructions record their guest RIP");
++    }
++    return Value;
++  }();
++  return On && TableInfo && (TableInfo->Flags & FEXCore::X86Tables::InstFlags::FLAGS_MEM_OFFSET);
++}
++
+ ContextImpl::GenerateIRResult
+ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
+   FEXCORE_PROFILE_SCOPED("GenerateIR");
+@@ -905,7 +921,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+     return {};
+   }
+ 
+-  Thread->OpDispatcher->ResetWorkingList();
++  if (!Thread->OpDispatcher->ResetWorkingList()) {   // pool-alloc-null-v1 madeira-bcd
++    // The IR buffer could not be allocated (the FEX address band is full and nothing idle was left to take back): no block is compiled;
++    // CompileBlock returns 0 and the guest gets its fault at its own RIP, instead of the emitter writing through NULL.
++    static int AllocN = 0;
++    if (AllocN++ < 12) {
++      LogMan::Msg::EFmt("[ir-alloc] rev=r652 no IR buffer for guest RIP {:#x} (the emulator's address band is exhausted): block not compiled", GuestRIP);
++    }
++    return {};
++  }
+ 
+   uint64_t TotalInstructions {0};
+   uint64_t TotalInstructionsLength {0};
+@@ -936,6 +960,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ 
+     /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] GenerateIR: Calling DecodeInstructionsAtEntry...");
+     Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
++    if (Thread->FrontendDecoder->AllocFailed()) {   // pool-alloc-null-v1 madeira-bcd
++      static int DecAllocN = 0;
++      if (DecAllocN++ < 12) {
++        LogMan::Msg::EFmt("[ir-alloc] rev=r652 no decoder buffer for guest RIP {:#x} (the emulator's address band is exhausted): block not compiled", GuestRIP);
++      }
++      Thread->OpDispatcher->DelayedDisownBuffer();
++      return {};
++    }
+     /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] GenerateIR: DecodeInstructionsAtEntry returned");
+ 
+     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
+@@ -1045,7 +1077,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         // that more explicitly later.
+         Thread->OpDispatcher->FlushRegisterCache(true);
+ 
+-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
++        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo) ||
++            MadeiraMoffsRip(TableInfo)) { // madeira-bcd: MADEIRA_FEX_MOFFS_RIP=1 (tools/patch-fex-ios-moffs-rip.py)
+           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
+         }
+ 
+@@ -2418,6 +2451,22 @@ static bool IosSkipInvalidationCallRetReset(FEXCore::Core::InternalThreadState*
+ 
+ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++#ifdef FEX_IOS_HOST
++  /* inval-null-thread-v1 madeira-bcd (tools/patch-fex-ios-inval-null-thread.py, round 630, Outlast Y09766): a thread without a decoder or a
++   * lookup cache has nothing cached to drop; walking into it faulted with this mutex and the thread mutex held, and every game
++   * thread then waited for ever. Skip it, and say so (at most 8 times a run). */
++  if (!Thread || !Thread->FrontendDecoder || !Thread->LookupCache) {
++    static std::atomic<unsigned> NullN {0};
++    if (NullN.fetch_add(1, std::memory_order_relaxed) < 8) {
++      LogMan::Msg::EFmt("[inval-null] Thread={} CurrentFrame={} Decoder={} Lookup={} range={:#x}+{:#x}: a thread state without its "
++                        "caches is skipped rev=r630",
++                        static_cast<void*>(Thread), Thread ? static_cast<void*>(Thread->CurrentFrame) : nullptr,
++                        Thread ? static_cast<void*>(Thread->FrontendDecoder.get()) : nullptr,
++                        Thread ? static_cast<void*>(Thread->LookupCache.get()) : nullptr, Start, Length);
++    }
++    return;
++  }
++#endif
+ 
+   // Ensures now-modified mappings aren't cached as being in their previous non-executable state.
+   // Accessing FrontendDecoder is safe as the thread's code invalidation mutex must be locked here.
+@@ -2529,9 +2578,59 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
+ }
+ 
+ 
++#ifdef FEX_IOS_HOST
++/* mono-bp-unlocked-miss-v1 madeira-bcd: MADEIRA_MONO_BP_UNLOCKED_MISS=1 opts in (read once). See MonoBackpatcherWrite. */
++static bool IosMonoMissUnlocked() {
++  /* A plain tri-state like the other switches of this module (no guarded static); two threads that race here read the same environment. */
++  static int On = -1;
++  if (On < 0) {
++    const char* Env = getenv("MADEIRA_MONO_BP_UNLOCKED_MISS");
++    On = (Env && Env[0] == '1' && !Env[1]) ? 1 : 0;
++  }
++  return On == 1;
++}
++#endif
++
+ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
+   auto Thread = Frame->Thread;
+   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
++#ifdef FEX_IOS_HOST
++  if (IosMonoMissUnlocked() && (Size == 4 || Size == 8)) {
++    /* mono-bp-unlocked-miss-v1 madeira-bcd: the store of an alias MISS runs without CodeInvalidationMutex. The direct store to a
++     * read+execute page raises an access violation inside this native function; the exception leaves it without running the
++     * lock's destructor and the thread then waits for the mutex it still owns ("[fexlock] STUCK write-wait", owner == waiter;
++     * Kindergarten, Mycopunk, Skate Story, build 622). A hit is stored through the alias under the mutex as before. */
++    uint64_t RW = 0;
++    {
++      auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
++      RW = IosMonoResolveRW(Address, Size);
++      ios_fex_mono_count_helper(RW ? 0 : 1);
++      if (RW) {
++        if (Size == 8) {
++          *reinterpret_cast<uint64_t*>(RW) = Value;
++        } else {
++          *reinterpret_cast<uint32_t*>(RW) = Value;
++        }
++      }
++    }
++    if (!RW) {
++      static std::atomic<int> MissLog {0};
++      if (MissLog.fetch_add(1, std::memory_order_relaxed) < 8) {
++        LogMan::Msg::EFmt("[mono-bp] RW miss: guest {:x} size {}: the direct store runs outside CodeInvalidationMutex "
++                          "(MADEIRA_MONO_BP_UNLOCKED_MISS=1, mono-bp-unlocked-miss-v1)",
++                          Address, Size);
++      }
++      const uint64_t Dest = Address + CTX->GetGuestBase();
++      if (Size == 8) {
++        *reinterpret_cast<uint64_t*>(Dest) = Value;
++      } else {
++        *reinterpret_cast<uint32_t*>(Dest) = Value;
++      }
++    }
++    CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
++    return;
++  }
++#endif
+   {
+     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
+ 
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index cc7ef7b..5c35d89 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1490,6 +1490,10 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
+   MaxCondBranchForward = 0;
+   MaxCondBranchBackwards = ~0ULL;
+   DecodedBuffer = PoolObject.ReownOrClaimBuffer();
++  HitAllocFailure = DecodedBuffer == nullptr;   // pool-alloc-null-v1 madeira-bcd: the pool had no 8 MB buffer to give; decode nothing instead of storing through NULL
++  if (HitAllocFailure) {
++    return;
++  }
+ 
+   // Decode operating mode from thread's CS segment.
+   const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index 7655c81..d5bee31 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -74,6 +74,11 @@ public:
+     PoolObject.DelayedDisownBuffer();
+   }
+ 
++  // pool-alloc-null-v1 madeira-bcd: the last DecodeInstructionsAtEntry found no decode buffer (nothing was decoded)
++  bool AllocFailed() const {
++    return HitAllocFailure;
++  }
++
+   void ResetExecutableRangeCache() {
+     ExecutableRangeBase = ExecutableRangeEnd = 0;
+   }
+@@ -128,6 +133,7 @@ private:
+   bool ExecutableRangeWritable {};
+   bool HitNonExecutableRange {};
+   bool HitBadRelocation {};
++  bool HitAllocFailure {};   // pool-alloc-null-v1 madeira-bcd
+ 
+   struct DecodeStream {
+     // Original instruction stream RIP location.
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 094e6f4..15ba7b7 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -8,8 +8,106 @@ $end_info$
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/Dispatcher/Dispatcher.h"
+ #include "Interface/Core/JIT/JITClass.h"
++#include <cstdlib>
+ 
+ namespace FEXCore::CPU {
++// split-lock-test:begin
++/* split-lock-v1 madeira-bcd (tools/patch-fex-ios-split-lock.py): an atomic whose operand crosses a 16-byte boundary faulted on
++ * Apple's LSE2 and was emulated by BCD's exception thread; on iOS it is done inline (see EmitAtomicRMW). */
++enum class SplitLockOp { Swap, Add, Clr, Set, Eor };
++
++static void EmitLSE(Arm64Emitter& E, SplitLockOp Op, ARMEmitter::SubRegSize Size, ARMEmitter::Register Value, ARMEmitter::Register Dst,
++                    ARMEmitter::Register Mem) {
++  switch (Op) {
++  case SplitLockOp::Swap: E.ldswpal(Size, Value, Dst, Mem); break;
++  case SplitLockOp::Add: E.ldaddal(Size, Value, Dst, Mem); break;
++  case SplitLockOp::Clr: E.ldclral(Size, Value, Dst, Mem); break;
++  case SplitLockOp::Set: E.ldsetal(Size, Value, Dst, Mem); break;
++  case SplitLockOp::Eor: E.ldeoral(Size, Value, Dst, Mem); break;
++  }
++}
++
++#ifdef FEX_IOS_HOST
++// Only exactly "1": on (default off). Read once, when the process's emulator first emits an atomic.
++static bool SplitLockEnabled() {
++  static const bool On = [] {
++    const char* Env = getenv("MADEIRA_FEX_SPLIT_LOCK");
++    return Env && Env[0] == '1' && !Env[1];
++  }();
++  return On;
++}
++
++// The lock of this process's crossing atomics, and how many times a waiter tries it before it leaves the operation to the trap.
++alignas(64) static uint32_t SplitLockWord;
++constexpr uint64_t SplitLockTries = 0x10000;
++#endif
++
++// The LSE read-modify-write `Op` of `Size` bytes at [Mem] with `Value`, the old value to `Dst`; on iOS a crossing operand is done
++// inline under the process's split lock instead of faulting.
++static void EmitAtomicRMW(Arm64Emitter& E, SplitLockOp Op, ARMEmitter::SubRegSize Size, ARMEmitter::Register Value,
++                          ARMEmitter::Register Dst, ARMEmitter::Register Mem) {
++#ifdef FEX_IOS_HOST
++  const uint32_t Bytes = 1u << FEXCore::ToUnderlying(Size);
++  if (Bytes > 1 && SplitLockEnabled()) {
++    ARMEmitter::ForwardLabel Crossing, Locked, Done;
++    ARMEmitter::BackwardLabel Spin;
++
++    // Bit 4 of first ^ last byte's address: set exactly when the operand (at most 8 bytes) crosses a 16-byte boundary.
++    E.add(ARMEmitter::Size::i64Bit, TMP1, Mem, Bytes - 1);
++    E.eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, Mem);
++    (void)E.tbnz(TMP1, 4, &Crossing);
++    EmitLSE(E, Op, Size, Value, Dst, Mem);
++    (void)E.b(&Done);
++
++    (void)E.Bind(&Crossing);
++    E.stadd(ARMEmitter::SubRegSize::i8Bit, ARMEmitter::Reg::zr, Mem);
++    E.add(ARMEmitter::Size::i64Bit, TMP1, Mem, Bytes - 1);
++    E.stadd(ARMEmitter::SubRegSize::i8Bit, ARMEmitter::Reg::zr, TMP1);
++    E.LoadConstant(ARMEmitter::Size::i64Bit, TMP1, reinterpret_cast<uintptr_t>(&SplitLockWord));
++    E.LoadConstant(ARMEmitter::Size::i64Bit, TMP3, SplitLockTries);
++    (void)E.Bind(&Spin);
++    E.movz(ARMEmitter::Size::i32Bit, TMP4, 1);
++    E.ldswpa(ARMEmitter::SubRegSize::i32Bit, TMP4, TMP4, TMP1);
++    (void)E.cbz(ARMEmitter::Size::i32Bit, TMP4, &Locked);
++    E.yield();
++    E.sub(ARMEmitter::Size::i64Bit, TMP3, TMP3, 1);
++    (void)E.cbnz(ARMEmitter::Size::i64Bit, TMP3, &Spin);
++    EmitLSE(E, Op, Size, Value, Dst, Mem);
++    (void)E.b(&Done);
++
++    (void)E.Bind(&Locked);
++    E.dmb(ARMEmitter::BarrierScope::ISH);
++    E.ldr(Size, TMP3, Mem);
++    switch (Op) {
++    case SplitLockOp::Swap: E.str(Size, Value, Mem); break;
++    case SplitLockOp::Add:
++      E.add(ARMEmitter::Size::i64Bit, TMP4, TMP3, Value);
++      E.str(Size, TMP4, Mem);
++      break;
++    case SplitLockOp::Clr:
++      E.bic(ARMEmitter::Size::i64Bit, TMP4, TMP3, Value);
++      E.str(Size, TMP4, Mem);
++      break;
++    case SplitLockOp::Set:
++      E.orr(ARMEmitter::Size::i64Bit, TMP4, TMP3, Value);
++      E.str(Size, TMP4, Mem);
++      break;
++    case SplitLockOp::Eor:
++      E.eor(ARMEmitter::Size::i64Bit, TMP4, TMP3, Value);
++      E.str(Size, TMP4, Mem);
++      break;
++    }
++    E.stlr(ARMEmitter::WReg::zr, TMP1);
++    E.dmb(ARMEmitter::BarrierScope::ISH);
++    E.mov(ARMEmitter::Size::i64Bit, Dst, TMP3.R());
++    (void)E.Bind(&Done);
++    return;
++  }
++#endif
++  EmitLSE(E, Op, Size, Value, Dst, Mem);
++}
++// split-lock-test:end
++
+ // Guest window: every address here is a guest address and is converted once, up front, into the reserved
+ // REG_GUEST_ADDR_TMP (see Arm64Emitter.h). Using a reserved register rather than one of TMP1-TMP4 is
+ // deliberate and load-bearing for exactly this file: CASPair and the LL/SC loops below park values
+@@ -164,7 +262,7 @@ DEF_OP(AtomicSwap) {
+                                                           ARMEmitter::SubRegSize::i8Bit;
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldswpal(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Swap, SubEmitSize, Src, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -184,7 +282,7 @@ DEF_OP(AtomicFetchAdd) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldaddal(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Add, SubEmitSize, Src, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -206,7 +304,7 @@ DEF_OP(AtomicFetchSub) {
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+     neg(EmitSize, TMP2, Src);
+-    ldaddal(SubEmitSize, TMP2, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Add, SubEmitSize, TMP2, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -228,7 +326,7 @@ DEF_OP(AtomicFetchAnd) {
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+     mvn(EmitSize, TMP2, Src);
+-    ldclral(SubEmitSize, TMP2, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Clr, SubEmitSize, TMP2, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -249,7 +347,7 @@ DEF_OP(AtomicFetchCLR) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldclral(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Clr, SubEmitSize, Src, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -270,7 +368,7 @@ DEF_OP(AtomicFetchOr) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldsetal(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Set, SubEmitSize, Src, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -291,7 +389,7 @@ DEF_OP(AtomicFetchXor) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldeoral(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitAtomicRMW(*this, SplitLockOp::Eor, SubEmitSize, Src, GetReg(Node), MemSrc);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 24b4b1d..328a922 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -1011,6 +1011,13 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   // This minimizes lock contention of CodeBufferWriteMutex.
+   // [iOS-Madeira] verbose SSACount/TempBuf logs suppressed
+   auto TempCodeBufferInfo = TempAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
++  if (!TempCodeBufferInfo.Ptr) {   // pool-alloc-null-v1 madeira-bcd: no temp buffer (the emulator's address band is exhausted): no code, CompileBlock returns 0
++    static int TempAllocN = 0;
++    if (TempAllocN++ < 12) {
++      LogMan::Msg::EFmt("[ir-alloc] rev=r652 no JIT temp buffer for guest RIP {:#x} (the emulator's address band is exhausted): block not compiled", Entry);
++    }
++    return {};
++  }
+   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
+   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index fec669f..b846ccc 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -232,30 +232,36 @@ void OpDispatchBuilder::SecondaryALUOp(OpcodeArgs) {
+   switch (Op->OP) {
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 0):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 0):
++  // madeira-bcd: 0x82 is 0x80's 32-bit-only alias (tools/patch-fex-ios-op82-alias.py)
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 0):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 0):
+     IROp = FEXCore::IR::IROps::OP_ADD;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHADD;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 1):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 1):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 1):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 1):
+     IROp = FEXCore::IR::IROps::OP_OR;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHOR;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 4):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 4):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 4):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 4):
+     IROp = FEXCore::IR::IROps::OP_ANDWITHFLAGS;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHAND;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 5):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 5):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 5):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 5):
+     IROp = FEXCore::IR::IROps::OP_SUB;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHSUB;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 6):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 6):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 6):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 6):
+     IROp = FEXCore::IR::IROps::OP_XOR;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHXOR;
+@@ -4707,8 +4713,10 @@ OpDispatchBuilder::OpDispatchBuilder(FEXCore::Context::ContextImpl* ctx, FEXCore
+   }
+ }
+ 
+-void OpDispatchBuilder::ResetWorkingList() {
+-  IREmitter::ReownOrClaimBuffer();
++bool OpDispatchBuilder::ResetWorkingList() {
++  if (!IREmitter::ReownOrClaimBuffer()) {   // pool-alloc-null-v1 madeira-bcd
++    return false;
++  }
+ 
+   JumpTargets.clear();
+   BlockSetRIP = false;
+@@ -4717,6 +4725,7 @@ void OpDispatchBuilder::ResetWorkingList() {
+   CurrentCodeBlock = nullptr;
+   RegCache.Written = 0;
+   RegCache.Cached = 0;
++  return true;
+ }
+ 
+ void OpDispatchBuilder::UnhandledOp(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 621ec1a..44c4575 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -306,7 +306,7 @@ public:
+   OpDispatchBuilder(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::InternalThreadState* Thread);
+ 
+   // Should only be called at the start of IR Emission.
+-  void ResetWorkingList();
++  bool ResetWorkingList();   // pool-alloc-null-v1 madeira-bcd: false when the IR buffer could not be allocated
+ 
+   void ResetDecodeFailure() {
+     NeedsBlockEnd = DecodeFailure = false;
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+index 176decf..3d4198f 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+@@ -337,7 +337,7 @@ constexpr std::array<X86InstInfo, MAX_REP_MOD_TABLE_SIZE> RepModOps = []() const
+     {0x2E, 2, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
+ 
+     {0x30, 16, X86InstInfo{"",         TYPE_COPY_OTHER, FLAGS_NONE,                                     0}},
+-    {0x40, 16, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                        0}},
++    {0x40, 16, X86InstInfo{"",         TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},   // repne-bit-ops-v1 madeira-bcd: F3 0F 40..4F = the unprefixed instruction
+ 
+     {0x50, 1, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
+     {0x51, 1, X86InstInfo{"SQRTSS",    TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_32BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                    0}},
+@@ -372,10 +372,10 @@ constexpr std::array<X86InstInfo, MAX_REP_MOD_TABLE_SIZE> RepModOps = []() const
+     {0xB8, 1, X86InstInfo{"POPCNT",    TYPE_INST, FLAGS_MODRM,                                      0}},
+     {0xB9, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},
+     {0xBA, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},
+-    {0xBB, 1, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
++    {0xBB, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},   // repne-bit-ops-v1 madeira-bcd: F3 0F BB = the unprefixed instruction
+     {0xBC, 1, X86InstInfo{"TZCNT",     TYPE_INST, FLAGS_MODRM,                                      0}},
+     {0xBD, 1, X86InstInfo{"LZCNT",     TYPE_INST, FLAGS_MODRM,                                      0}},
+-    {0xBE, 2, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                        0}},
++    {0xBE, 2, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},   // repne-bit-ops-v1 madeira-bcd: F3 0F BE..BF = the unprefixed instruction
+ 
+     {0xC0, 2, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                     0}},
+     {0xC2, 1, X86InstInfo{"CMPSS",     TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_32BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                    1}},
+@@ -424,7 +424,7 @@ constexpr std::array<X86InstInfo, MAX_REPNE_MOD_TABLE_SIZE> RepNEModOps = []() c
+     {0x2E, 2, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+ 
+     {0x30, 16, X86InstInfo{"",         TYPE_COPY_OTHER, FLAGS_NONE,                                                      0}},
+-    {0x40, 16, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                                         0}},
++    {0x40, 16, X86InstInfo{"",         TYPE_COPY_OTHER, FLAGS_NONE,                                                         0}},   // repne-bit-ops-v1 madeira-bcd: F2 0F 40..4F = the unprefixed instruction
+ 
+     {0x50, 1, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+     {0x51, 1, X86InstInfo{"SQRTSD",    TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS, 0}},
+@@ -457,7 +457,7 @@ constexpr std::array<X86InstInfo, MAX_REPNE_MOD_TABLE_SIZE> RepNEModOps = []() c
+     {0xB8, 1, X86InstInfo{"",           TYPE_INVALID, FLAGS_NONE,                                                               0}},
+     {0xB9, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},
+     {0xBA, 1, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                        0}},
+-    {0xBB, 5,  X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE,                                                         0}},
++    {0xBB, 5,  X86InstInfo{"",         TYPE_COPY_OTHER, FLAGS_NONE,                                                         0}},   // repne-bit-ops-v1 madeira-bcd: F2 0F BB..BF = the unprefixed instruction
+     {0xC0, 2, X86InstInfo{"",          TYPE_COPY_OTHER, FLAGS_NONE,                                                      0}},
+     {0xC2, 1, X86InstInfo{"CMPSD",     TYPE_INST, GenFlagsSizes(SIZE_128BIT, SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                    1}},
+     {0xC3, 5, X86InstInfo{"",          TYPE_INVALID, FLAGS_NONE,                                                         0}},
+diff --git a/FEXCore/Source/Interface/IR/IREmitter.h b/FEXCore/Source/Interface/IR/IREmitter.h
+index 3bda998..ad0d772 100644
+--- a/FEXCore/Source/Interface/IR/IREmitter.h
++++ b/FEXCore/Source/Interface/IR/IREmitter.h
+@@ -25,11 +25,15 @@ public:
+ 
+   virtual ~IREmitter() = default;
+ 
+-  void ReownOrClaimBuffer() {
+-    DualListData.ReownOrClaimBuffer();
++  // pool-alloc-null-v1 madeira-bcd: false when the pool could not supply the buffer (nothing is written then)
++  bool ReownOrClaimBuffer() {
++    if (!DualListData.ReownOrClaimBuffer()) {
++      return false;
++    }
+ 
+     // Reset the working list on new buffer.
+     ResetWorkingList();
++    return true;
+   }
+ 
+   void DelayedDisownBuffer() {
+diff --git a/FEXCore/Source/Interface/IR/IntrusiveIRList.h b/FEXCore/Source/Interface/IR/IntrusiveIRList.h
+index 3c00ac1..7eed7fe 100644
+--- a/FEXCore/Source/Interface/IR/IntrusiveIRList.h
++++ b/FEXCore/Source/Interface/IR/IntrusiveIRList.h
+@@ -120,9 +120,15 @@ public:
+   DualIntrusiveAllocatorThreadPool(FEXCore::Utils::IntrusivePooledAllocator& ThreadAllocator, size_t Size)
+     : DualIntrusiveAllocator {Size}
+     , PoolObject {ThreadAllocator, Size * 2} {}
+-  void ReownOrClaimBuffer() {
++  // pool-alloc-null-v1 madeira-bcd: false when the pool could not supply the buffer (Data and List are then 0)
++  bool ReownOrClaimBuffer() {
+     Data = PoolObject.ReownOrClaimBuffer();
++    if (!Data) {
++      List = 0;
++      return false;
++    }
+     List = Data + MemorySize;
++    return true;
+   }
+ 
+   void DelayedDisownBuffer() {
+diff --git a/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h b/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
+index 1c0c8b8..27d8a27 100644
+--- a/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
++++ b/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
+@@ -108,12 +108,15 @@ public:
+    *
+    * Once a buffer is claimed, the pool allocator can not reclaim this buffer until it is "Disowned"
+    *
+-   * @return iterator to the internal tracking container
++   * @return iterator to the internal tracking container; std::nullopt when no buffer could be allocated (the flag stays FREE)
+    */
+-  ContainerType::iterator ClaimBuffer(size_t Size, BufferOwnedFlag* CurrentClientFlag) {
++  std::optional<ContainerType::iterator> ClaimBuffer(size_t Size, BufferOwnedFlag* CurrentClientFlag) {
+     std::unique_lock lk {AllocationMutex};
+     auto Buffer = ClaimBufferImpl(Size);
+-    (*Buffer)->CurrentClientOwnedFlag = CurrentClientFlag;
++    if (!Buffer) {   // pool-alloc-null-v1 madeira-bcd
++      return std::nullopt;
++    }
++    (**Buffer)->CurrentClientOwnedFlag = CurrentClientFlag;
+     CurrentClientFlag->store(ClientFlags::FLAG_OWNED);
+     return Buffer;
+   }
+@@ -183,7 +186,7 @@ public:
+    *
+    * @return The original buffer passed in on successful reown, otherwise a new buffer
+    */
+-  ContainerType::iterator ReownOrClaimBuffer(const ContainerType::iterator& Buffer, size_t Size, BufferOwnedFlag* CurrentClientFlag) {
++  std::optional<ContainerType::iterator> ReownOrClaimBuffer(const ContainerType::iterator& Buffer, size_t Size, BufferOwnedFlag* CurrentClientFlag) {
+     auto Reowned = TryToReownBuffer(Buffer, Size, CurrentClientFlag);
+     if (Reowned) {
+       return Reowned.value();
+@@ -206,7 +209,7 @@ public:
+ protected:
+   IntrusivePooledAllocator() = default;
+ 
+-  ContainerType::iterator ClaimBufferImpl(size_t Size) {
++  std::optional<ContainerType::iterator> ClaimBufferImpl(size_t Size) {
+     auto BuffersEnd = UnclaimedBuffers.end();
+     ContainerType::iterator BestFit = BuffersEnd;
+     ContainerType::iterator UnsizedFit = BuffersEnd;
+@@ -292,9 +295,40 @@ protected:
+ 
+     // Need to allocate a new buffer, couldn't fit
+     auto Data = Alloc(Size);
++    if (!Data) {
++      // pool-alloc-null-v1 madeira-bcd: the address band is full (Alloc returns nullptr by design). Take back every buffer a client has disowned and
++      // free every unclaimed one (a disowned buffer may be reclaimed at any time, only the age test is skipped), then try once more.
++      ReclaimIdleBuffersNow();
++      Data = Alloc(Size);
++      if (!Data) {
++        return std::nullopt;
++      }
++    }
+     return ClaimedBuffers.emplace(ClaimedBuffers.end(), new MemoryBuffer {Data, Size, ClockType::now()});
+   }
+ 
++  // pool-alloc-null-v1 madeira-bcd: the allocation failed; give every idle byte back to the allocator before the one retry.
++  void ReclaimIdleBuffersNow() {
++    for (auto it = ClaimedBuffers.begin(); it != ClaimedBuffers.end();) {
++      if ((*it)->CurrentClientOwnedFlag->load() == ClientFlags::FLAG_DISOWNED) {
++        ClientFlags Expected = ClientFlags::FLAG_DISOWNED;
++        if ((*it)->CurrentClientOwnedFlag->compare_exchange_strong(Expected, ClientFlags::FLAG_FREE)) {
++          // The same hand-over as the retirement above: the client's re-own compare-exchange now fails and it claims a new buffer.
++          (*it)->CurrentClientOwnedFlag = nullptr;
++          UnclaimedBuffers.emplace_back(*it);
++          it = ClaimedBuffers.erase(it);
++          continue;
++        }
++      }
++      ++it;
++    }
++    for (auto* Buffer : UnclaimedBuffers) {
++      Free(Buffer->Ptr, Buffer->Size);
++      delete Buffer;
++    }
++    UnclaimedBuffers.clear();
++  }
++
+   void UnclaimBufferImpl(ContainerType::iterator Buffer) {
+     (*Buffer)->CurrentClientOwnedFlag = nullptr;
+     UnclaimedBuffers.emplace_back(*Buffer);
+@@ -386,7 +420,7 @@ public:
+ private:
+   void* Alloc(size_t Size) override {
+     auto Result = FEXCore::Allocator::VirtualAlloc(Size);
+-    if (Name) {
++    if (Name && Result) {   // pool-alloc-null-v1 madeira-bcd
+       FEXCore::Allocator::VirtualName(Name, Result, Size);
+     }
+     return Result;
+@@ -417,6 +451,9 @@ public:
+ private:
+   void* Alloc(size_t Size) override {
+     auto Ptr = FEXCore::Allocator::VirtualAlloc(Size);
++    if (!Ptr) {   // pool-alloc-null-v1 madeira-bcd
++      return Ptr;
++    }
+     uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+     if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+                                             FEXCore::Allocator::ProtectOptions::None)) {
+@@ -522,6 +559,12 @@ public:
+     Size = NewSize.value_or(Size);
+     if (!Buffer) {
+       Buffer = ThreadAllocator.ClaimBuffer(Size, &ClientOwnedFlag);
++      if (!Buffer) {   // pool-alloc-null-v1 madeira-bcd: no buffer could be allocated; the flag stays FREE and Info is not touched
++        return {
++          .Ptr = Type {},
++          .Size = 0,
++        };
++      }
+     }
+ 
+     Info = *Buffer;
+@@ -550,6 +593,9 @@ public:
+    * If the frequency of use is below the threshold then immediately `UnclaimBuffer` so that `Allocator` can reuse it.
+    */
+   void DelayedDisownBuffer() {
++    if (FEXCore::Utils::IntrusivePooledAllocator::IsClientBufferFree(ClientOwnedFlag)) {   // pool-alloc-null-v1 madeira-bcd: never claimed (the allocation failed)
++      return;
++    }
+     LOGMAN_THROW_A_FMT(FEXCore::Utils::IntrusivePooledAllocator::IsClientBufferOwned(ClientOwnedFlag), "Tried to disown buffer when client "
+                                                                                                        "doesn't own it");
+ 
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 2a76ec2..063912c 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -284,6 +284,25 @@ ThreadCPUArea GetCPUArea() {
+ #endif
+ }
+ 
++// ec-no-cpu-area-v1 madeira-bcd (round 2026-11-11, R1-S3 / X1 S1c): a native ARM64 thread of an ARM64EC session (services.exe, cmd.exe, conhost.exe)
++// has TEB->ChpeV2CpuAreaInfo == NULL (build/ntdll-unix/thread_ios.c, "NOT setting cpu_area") although the ARM64EC ntdll still calls
++// these hooks for it. Such a thread is not emulated: there is no thread state to ask for. A TEB that cannot be read keeps the old path.
++inline bool HasCPUArea() {
++#ifdef FEX_IOS_HOST
++  const _TEB* Teb = IOSLoadTEB();
++#else
++  const _TEB* Teb = NtCurrentTeb();
++#endif
++  if (!Teb) {
++    return true;
++  }
++  return *reinterpret_cast<void* const*>(reinterpret_cast<uintptr_t>(Teb) + ThreadCPUArea::TEBCPUAreaOffset) != nullptr;
++}
++
++inline bool HasEmulatorThreadState() {
++  return HasCPUArea() && GetCPUArea().ThreadState();
++}
++
+ #ifdef FEX_IOS_HOST
+ /* iOS-Madeira ml259 PROBE (#44). The CEF thread (0098) executes FEX JIT with x28 == 0:
+  *   insn ldr x0,[x28,#0x658] faults with addr=0x658 -- the fault address IS the
+@@ -1530,6 +1549,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+     if (IosDeferAvLog) IosLogAv();   /* ml1055: NOT self-modifying code -- a real fault, always logged */
+   }
+ 
++  if (!CTX) {   // ec-teardown-ctx-v1 madeira-bcd (round 626): the emulator was torn down while the process ends; nothing here can
++    return false;   // handle this exception, so it goes on to Wine (as for any pc outside the JIT) instead of faulting here
++  }
+   bool IsJIT = CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc);
+   if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Exception::HandleUnalignedAccess(CPUArea, *NativeContext, IsJIT)) {
+     LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", NativeContext->Pc);
+@@ -1580,6 +1602,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+ }
+ 
+ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
++  if (!HasCPUArea()) {   // ec-no-cpu-area-v1 madeira-bcd: a native ARM64 thread of an ARM64EC session is not emulated; Wine goes on with the exception
++    return STATUS_SUCCESS;
++  }
+   bool Cont {};
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+@@ -1636,7 +1661,7 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
+  * required for its correctness. Drop the BEFORE/AFTER mutex entirely
+  * and just call into the tracker directly on AFTER. */
+ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1649,7 +1674,7 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL
+ }
+ 
+ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1661,7 +1686,7 @@ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NT
+ }
+ 
+ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1787,7 +1812,7 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
+ }
+ 
+ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1803,7 +1828,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
+ }
+ 
+ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1812,7 +1837,7 @@ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
+ }
+ 
+ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1821,7 +1846,7 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+ }
+ 
+ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
+-  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
++  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !HasEmulatorThreadState()) {   // ec-no-cpu-area-v1 madeira-bcd
+     return;
+   }
+ 
+@@ -1860,7 +1885,7 @@ static bool* IosInLockedRWXReadSlot() {
+ }
+ 
+ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status) {
+-  auto* ThreadState = GetCPUArea().ThreadState();
++  auto* ThreadState = HasCPUArea() ? GetCPUArea().ThreadState() : nullptr;   // ec-no-cpu-area-v1 madeira-bcd
+   bool* InLockedRead = IosInLockedRWXReadSlot();
+ 
+   if (After) {
+@@ -1974,7 +1999,7 @@ extern "C" uint32_t BTCpu64IosReleaseThreadHolds(void* TebPtr, uint64_t* OutStam
+   // Rule 3 first: the exclusive pair, in NotifyReadFile's own release order.
+   if (RWXRead) {
+     *InLockedRead = false;
+-    auto* ThreadState = GetCPUArea().ThreadState();
++    auto* ThreadState = HasCPUArea() ? GetCPUArea().ThreadState() : nullptr;   // ec-no-cpu-area-v1 madeira-bcd
+     if (ThreadState) {
+       GetFrontendThreadData(ThreadState)->InLockedRWXRead = false;
+     }
+@@ -2019,6 +2044,9 @@ static void IosTiLog(const char* msg) {
+ #endif
+ 
+ NTSTATUS ThreadInit() {
++  if (!HasCPUArea()) {   // ec-no-cpu-area-v1 madeira-bcd: a native ARM64 thread of an ARM64EC session has no emulator state to build
++    return STATUS_SUCCESS;
++  }
+ #ifdef FEX_IOS_HOST
+   /* iOS-Madeira diagnostic: log entry to thread-init so we can confirm Wine
+    * is calling BTCpu64ThreadInit for the main x86_64 thread before the
+@@ -2529,6 +2557,10 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
+ 
+   FEX::Windows::CallRetStack::DestroyThread(ThreadState);
+   CTX->DestroyThread(ThreadState);
++  // threadterm-clear-area-v1 madeira-bcd: the state is gone; the CPU area must not name it (an exception on this thread reaches ResetToConsistentState,
++  // whose `!CPUArea.ThreadState()` guard is for exactly this: Splinter Cell Conviction 2QWXFW read the freed state through the stale slot)
++  CPUArea.ThreadState() = nullptr;
++  CPUArea.StateFrame() = nullptr;
+   ::VirtualFree(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0, MEM_RELEASE);
+   if (ThreadTID == GetCurrentThreadId()) {
+     static std::atomic<uint32_t> DeinitCount;
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 073d558..2b66209 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -480,6 +480,9 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+                       SectionBase, SectionBase + SectionSize);
+     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
++    if (DEPDisabled) {   // dep-promote-stale-v1 madeira-bcd: a freed page is no longer "promoted"
++      DEPPromotedIntervals.Remove({SectionBase, SectionBase + SectionSize});
++    }
+     ForgetHotSMCPages(SectionBase, SectionBase + SectionSize);
+   }
+ 
+@@ -517,6 +520,9 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+     }
+     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    if (DEPDisabled) {   // dep-promote-stale-v1 madeira-bcd: a freed page is no longer "promoted"
++      DEPPromotedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    }
+     ForgetHotSMCPages(AlignedBase, AlignedBase + AlignedSize);
+   }
+ }
+@@ -730,7 +736,9 @@ FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionL
+   const auto AlignedSize = (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+   FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+ 
+-  if (DEPPromotedIntervals.Query(Address).Enclosed) {
++  // dep-promote-stale-v1 madeira-bcd: a record of an earlier promotion counts only while the page is still executable; a page that was freed and allocated
++  // again (a stale record) is promoted again, instead of being reported as not executable.
++  if (DEPPromotedIntervals.Query(Address).Enclosed && XIntervals.Query(Address).Enclosed) {
+     return ProtInterval;
+   }
+ 
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 0ced346..f85f3bb 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -56,6 +56,7 @@ $end_info$
+ #include <mutex>
+ #include <utility>
+ #include <unordered_map>
++#include <new> // madeira-bcd: wow64-ctor-guard v1 (placement new for the thread map)
+ #include <ntstatus.h>
+ #include <windef.h>
+ #include <winternl.h>
+@@ -357,7 +358,40 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
+ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
+ std::optional<FEX::Windows::ImageTracker> ImageTracker;
+ 
+-std::mutex ThreadCreationMutex;
++// wow64-tcm-recursive v1 madeira-bcd (tools/patch-fex-ios-wow-recursive-tcm.py; FTL PHE15B, Peggle SF5ZDS, night round 2026-11-11).
++// wow64.dll's NtProtectVirtualMemory thunk holds this lock from BTCpuNotifyMemoryProtect(FALSE) to (TRUE) while the unix call stores the old
++// protection through the 32-bit program's own pointer. A sound library (BASS) passes a pointer into an SMC-armed page, the store faults, and
++// the exception path (BTCpuResetToConsistentStateImpl's AV branch) takes this lock again on the same thread. A std::mutex waits for
++// itself for ever; this one lets its owner in again. Zero-state like the std::mutex it wraps (constinit: no run-time constructor).
++class RecursiveThreadCreationMutex {
++public:
++  void lock() {
++    const auto Self = reinterpret_cast<uintptr_t>(CurrentTEB());
++    if (Self && Owner.load(std::memory_order_relaxed) == Self) {
++      ++Depth;
++      return;
++    }
++    M.lock();
++    Owner.store(Self, std::memory_order_relaxed);
++    Depth = 1;
++  }
++
++  void unlock() {
++    if (Depth > 1) {
++      --Depth;
++      return;
++    }
++    Depth = 0;
++    Owner.store(0, std::memory_order_relaxed);
++    M.unlock();
++  }
++
++private:
++  std::mutex M;
++  std::atomic<uintptr_t> Owner {0};
++  uint32_t Depth {0};
++};
++constinit RecursiveThreadCreationMutex ThreadCreationMutex;
+ // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
+ std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
+ 
+@@ -1087,6 +1121,13 @@ extern "C" __attribute__((naked)) void IosWowSyscallEntry() {
+ 
+ void BTCpuProcessInit() {
+   FEX::Windows::InitCRTProcess();
++#ifdef FEX_IOS_HOST
++  /* madeira-bcd: wow64-ctor-guard v1. The state of this module's global thread map as the module
++   * starts. A map its static initialiser touched has max_load_factor 1; an all-zero one (0) makes the
++   * first emplace throw, and the throw ends the process (see tools/patch-fex-ios-wow-threads-ctor.py). */
++  IosRawReport("E [wow64-ctor] madeira-bcd: Threads@{} max_load_factor={} bucket_count={} size={} (1 = the static initialiser ran)",
++               static_cast<void*>(&Threads), Threads.max_load_factor(), Threads.bucket_count(), Threads.size());
++#endif
+ 
+ #ifdef FEX_IOS_HOST
+   /* MADEIRA: import the TEB TSD slot offset before anything reads a TEB. A missing or zero export
+@@ -1464,11 +1505,28 @@ void BTCpuProcessInit() {
+ 
+ void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
+ 
++#ifdef FEX_IOS_HOST
++// madeira-bcd: thread-init-nomem v1: not declared by FEX's winternl.h; ntdll exports it (Source/Windows/Defs/ntdll.def)
++extern "C" NTSTATUS WINAPI NtTerminateThread(HANDLE, LONG);
++#endif
+ void BTCpuThreadInit() {
+   static constexpr size_t DefaultWow64CS {4};
+-  std::scoped_lock Lock(ThreadCreationMutex);
++  std::unique_lock Lock(ThreadCreationMutex); // madeira-bcd: thread-init-nomem v1: released before a thread without a state ends
+   FEX::Windows::InitCRTThread();
+   auto* Thread = CTX->CreateThread(0, 0);
++#ifdef FEX_IOS_HOST
++  /* madeira-bcd: thread-init-nomem v1 (tools/patch-fex-ios-thread-init-nomem.py, round 630): CreateThread returns NULL when the emulator's
++   * window has no room for another thread state (the 32-bit Steam client on a 63 GB address map: 9PB1B5, W2J15H, R883EG).
++   * The lines below used it at once and the NULL read ended the whole process. This thread ends alone instead; the lock is
++   * released first, since the thread never returns from NtTerminateThread. */
++  if (!Thread) {
++    LogMan::Msg::EFmt("[wow64-tls] tid={:#x} CreateThread returned null: no room for another thread state; this thread ends "
++                      "with STATUS_NO_MEMORY (madeira-bcd thread-init-nomem)", GetCurrentThreadId());
++    Lock.unlock();
++    NtTerminateThread(NtCurrentThread(), STATUS_NO_MEMORY);
++    return;
++  }
++#endif
+ 
+   // Default segment setup.
+   auto Frame = Thread->CurrentFrame;
+@@ -1517,6 +1575,17 @@ void BTCpuThreadInit() {
+   }
+ #endif
+ 
++#ifdef FEX_IOS_HOST
++  /* madeira-bcd: wow64-ctor-guard v1. A thread map that still has no initial state (max_load_factor 0:
++   * its static initialiser did not take effect, as on iOS 18) would throw inside emplace below, and the
++   * throw ends the process. Construct it now; a map that was initialised never gets here. */
++  if (Threads.max_load_factor() <= 0.0f) {
++    LogMan::Msg::EFmt("[wow64-ctor] madeira-bcd: Threads@{} max_load_factor={} bucket_count={} size={}: the static initialiser "
++                      "had no effect; constructing the thread map now",
++                      static_cast<void*>(&Threads), Threads.max_load_factor(), Threads.bucket_count(), Threads.size());
++    ::new (static_cast<void*>(&Threads)) std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>();
++  }
++#endif
+   auto ThreadTID = GetCurrentThreadId();
+   Threads.emplace(ThreadTID, Thread);
+   if (StatAllocHandler) {

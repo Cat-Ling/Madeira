@@ -53,6 +53,7 @@ else
     echo "ERROR: wine-opengl-winios.patch does not apply cleanly to $R/wine" >&2
     exit 1
 fi
+bash "$R/build/wine-patches/apply.sh"
 
 # ---------------------------------------------------------------- configure
 # Its own tree, like build-arm64ec: reconfiguring build-macos with an extra

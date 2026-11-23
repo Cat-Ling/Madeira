@@ -19,6 +19,7 @@ else
   echo "ERROR: wine-opengl-winios.patch does not apply cleanly to $WINE" >&2
   exit 1
 fi
+bash "$ROOT/build/wine-patches/apply.sh"
 
 # Native macOS build tree. Madeira's iOS unix-side libraries consume config.h,
 # generated headers, and host build outputs from here. aarch64 is the native

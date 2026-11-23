@@ -1,0 +1,1000 @@
+diff --git a/FEXCore/Source/CMakeLists.txt b/FEXCore/Source/CMakeLists.txt
+index 40b9214..6535456 100644
+--- a/FEXCore/Source/CMakeLists.txt
++++ b/FEXCore/Source/CMakeLists.txt
+@@ -66,6 +66,7 @@ set(SRCS
+   Interface/IR/Passes/RegisterAllocationPass.cpp
+   Interface/IR/Passes/x87StackOptimizationPass.cpp
+   Utils/AllocWatch.cpp
++  Utils/FPState.cpp
+   Utils/LongJump.cpp
+   Utils/Telemetry.cpp
+   Utils/Threads.cpp
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 21eadbe..f31aae3 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -436,9 +436,11 @@ void Dispatcher::EmitDispatcher() {
+     sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+ 
+-    // Trigger segfault if any deferred signals are pending
+-    strb(ARMEmitter::XReg::zr, STATE,
+-         offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
++    // The page can be more than 4095 bytes from the frame after alignment.
++    constexpr auto FaultPageOffset = offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
++                                     offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP2, FaultPageOffset);
++    strb(ARMEmitter::XReg::zr, STATE, TMP2, ARMEmitter::ExtendedType::LSL_64, 0);
+ #endif
+   };
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 44c4575..d999382 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -14,6 +14,7 @@
+ #include <FEXCore/Core/X86Enums.h>
+ #include <FEXCore/IR/IR.h>
+ 
++#include <FEXCore/Utils/FPState.h> // madeira-bcd x87-exact: added (X87ExactInt64)
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/MathUtils.h>
+ #include <FEXCore/fextl/map.h>
+@@ -2041,6 +2042,9 @@ private:
+   void StoreContext(uint8_t Index, Ref Value) {
+     LOGMAN_THROW_A_FMT(Index < 64, "valid index");
+     LOGMAN_THROW_A_FMT(Value != InvalidNode, "storing valid");
++    if (FPState::X87ExactInt64() && Index >= MM0Index && Index <= MM7Index) { // madeira-bcd x87-exact: on
++      _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(FEXCore::Core::CpuStateFrame, x87_exact_valid));
++    } // madeira-bcd x87-exact: end
+ 
+     uint64_t Bit = (1ull << (uint64_t)Index);
+ 
+@@ -2384,6 +2388,8 @@ private:
+   /**  @} */
+ 
+   Ref GetX87Top();
++  Ref SaveReducedX87Value(Ref Top, Ref Value); // madeira-bcd x87-exact: added (called only with the switch on)
++  Ref RestoreReducedX87Value(Ref Top, Ref Value, Ref Mask); // madeira-bcd x87-exact: added (called only with the switch on)
+   void SetX87FTW(Ref FTW);
+   Ref GetX87FTW_Helper();
+   void SetX87Top(Ref Value);
+@@ -2391,6 +2397,9 @@ private:
+   void ChgStateX87_MMX() override {
+     LOGMAN_THROW_A_FMT(MMXState == MMXState_X87, "Expected state to be x87");
+     _StackForceSlow();
++    if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++      _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(FEXCore::Core::CpuStateFrame, x87_exact_valid));
++    } // madeira-bcd x87-exact: end
+     SetX87Top(Constant(0)); // top reset to zero
+     _StoreContextGPR(OpSize::i8Bit, Constant(0xFFFFUL), offsetof(FEXCore::Core::CPUState, AbridgedFTW));
+     MMXState = MMXState_MMX;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index b3c70bd..fb9aa2b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -3112,7 +3112,11 @@ void OpDispatchBuilder::SaveX87State(OpcodeArgs, Ref MemBase) {
+   for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
+     Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+     if (ReducedPrecisionMode) {
+-      data = _F80CVTTo(data, OpSize::i64Bit);
++      if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++        data = SaveReducedX87Value(Top, data);
++      } else { // madeira-bcd x87-exact: off
++        data = _F80CVTTo(data, OpSize::i64Bit);
++      } // madeira-bcd x87-exact: end
+     }
+     _StoreMemFPR(OpSize::i128Bit, data, MemBase, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+     Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
+@@ -3227,6 +3231,9 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+ 
+ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
+   _StackForceSlow();
++  if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++    _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(FEXCore::Core::CpuStateFrame, x87_exact_valid));
++  } // madeira-bcd x87-exact: end
+ 
+   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, MemBase, OpSize::i16Bit);
+   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
+@@ -3242,11 +3249,29 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
+     _StoreContextGPR(OpSize::i8Bit, NewFTW, offsetof(FEXCore::Core::CPUState, AbridgedFTW));
+   }
+ 
+-  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; i += 2) {
+-    auto MMRegs = LoadMemPairFPR(OpSize::i128Bit, MemBase, i * 16 + 32);
+-    _StoreContextFPR(OpSize::i128Bit, MMRegs.Low, MMBaseOffset() + i * 16);
+-    _StoreContextFPR(OpSize::i128Bit, MMRegs.High, MMBaseOffset() + (i + 1) * 16);
+-  }
++  if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++    // The registers of an FXSAVE image are in stack order (SaveX87State), and in reduced precision they are doubles here.
++    Ref Top = GetX87Top();
++    Ref ExactMask = Constant(0);
++    for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
++      Ref Value = _LoadMemFPR(OpSize::i128Bit, MemBase, Constant(i * 16 + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
++      if (ReducedPrecisionMode) {
++        ExactMask = RestoreReducedX87Value(Top, Value, ExactMask);
++        Value = _F80CVT(OpSize::i64Bit, Value);
++      }
++      _StoreContextFPRIndexed(Value, Top, ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit, MMBaseOffset(), 16);
++      Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), Constant(7));
++    }
++    if (ReducedPrecisionMode) {
++      _StoreContextGPR(OpSize::i32Bit, ExactMask, offsetof(Core::CpuStateFrame, x87_exact_valid));
++    }
++  } else { // madeira-bcd x87-exact: off
++    for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; i += 2) {
++      auto MMRegs = LoadMemPairFPR(OpSize::i128Bit, MemBase, i * 16 + 32);
++      _StoreContextFPR(OpSize::i128Bit, MMRegs.Low, MMBaseOffset() + i * 16);
++      _StoreContextFPR(OpSize::i128Bit, MMRegs.High, MMBaseOffset() + (i + 1) * 16);
++    }
++  } // madeira-bcd x87-exact: end
+ }
+ 
+ void OpDispatchBuilder::RestoreSSEState(Ref MemBase) {
+@@ -3286,6 +3311,9 @@ void OpDispatchBuilder::DefaultX87State(OpcodeArgs) {
+   // We can piggy-back on FNINIT's implementation, since
+   // it performs the same behavior as required by XRSTOR for resetting flags
+   FNINIT(Op);
++  if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++    _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(FEXCore::Core::CpuStateFrame, x87_exact_valid));
++  } // madeira-bcd x87-exact: end
+ 
+   // On top of resetting the flags to a default state, we also need to clear
+   // all of the ST0-7/MM0-7 registers to zero.
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index ca9cb9f..3daffba 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -30,8 +30,55 @@ Ref OpDispatchBuilder::GetX87Top() {
+   return _LoadContextGPR(OpSize::i8Bit, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_TOP_LOC);
+ }
+ 
++// madeira-bcd x87-exact: added {
++// Both are called only with the switch on (FPState::X87ExactInt64).
++// Save the original integer in the architectural 80-bit format when it is known.
++Ref OpDispatchBuilder::SaveReducedX87Value(Ref Top, Ref Value) {
++  Ref Mask = _LoadContextGPR(OpSize::i32Bit, offsetof(Core::CpuStateFrame, x87_exact_valid));
++  Ref Tags = _LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, AbridgedFTW));
++  Ref Valid = _And(OpSize::i64Bit, _Lshr(OpSize::i64Bit, _And(OpSize::i64Bit, Mask, Tags), Top), Constant(1));
++  Ref Integer = _LoadContextGPRIndexed(_Lshl(OpSize::i32Bit, Top, Constant(1)), OpSize::i64Bit, offsetof(Core::CpuStateFrame, x87_exact_int), 8);
++  Ref Zero = Constant(0);
++  Ref Sign = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SLT, Integer, Zero, Constant(0x8000), Zero);
++  Ref Magnitude = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SLT, Integer, Zero, Sub(OpSize::i64Bit, Zero, Integer), Integer);
++  Ref Shift = Sub(OpSize::i64Bit, Constant(63), _FindMSB(OpSize::i64Bit, Magnitude));
++  Ref Mantissa = _Lshl(OpSize::i64Bit, Magnitude, Shift);
++  Ref Exponent = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Magnitude, Zero, Zero, Sub(OpSize::i64Bit, Constant(0x403e), Shift));
++  Ref Original = _F80CVTTo(Value, OpSize::i64Bit);
++  Ref Low = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Valid, Zero, Mantissa, _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Original, 0));
++  Ref High = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Valid, Zero, _Or(OpSize::i64Bit, Sign, Exponent), _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Original, 1));
++  return _VLoadTwoGPRs(Low, High);
++}
++
++// Recover an exact signed integer only when the saved 80-bit value is integral and in range.
++Ref OpDispatchBuilder::RestoreReducedX87Value(Ref Top, Ref Value, Ref Mask) {
++  Ref Zero = Constant(0), One = Constant(1);
++  Ref Mantissa = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Value, 0);
++  Ref High = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Value, 1);
++  Ref Exponent = _And(OpSize::i64Bit, High, Constant(0x7fff));
++  Ref Sign = _And(OpSize::i64Bit, High, Constant(0x8000));
++  Ref Shift = Sub(OpSize::i64Bit, Constant(0x403e), Exponent);
++  Ref Magnitude = _Lshr(OpSize::i64Bit, Mantissa, Shift);
++  Ref Equal = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, _Lshl(OpSize::i64Bit, Magnitude, Shift), Mantissa, One, Zero);
++  Ref Lower = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGE, Exponent, Constant(0x3fff), One, Zero);
++  Ref Upper = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::ULT, Exponent, Constant(0x403e), One, Zero);
++  Ref Limit = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Exponent, Constant(0x403e), One, Zero);
++  Ref Negative = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Sign, Zero, One, Zero);
++  Ref ExactLimit = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Mantissa, Constant(0x8000000000000000ULL), One, Zero);
++  Limit = _And(OpSize::i64Bit, Limit, _And(OpSize::i64Bit, Negative, ExactLimit));
++  Ref Normal = _Lshr(OpSize::i64Bit, Mantissa, Constant(63));
++  Ref Valid = _And(OpSize::i64Bit, Equal, _And(OpSize::i64Bit, Lower, _And(OpSize::i64Bit, Normal, _Or(OpSize::i64Bit, Upper, Limit))));
++  Ref Integer = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Sign, Zero, Sub(OpSize::i64Bit, Zero, Magnitude), Magnitude);
++  _StoreContextGPRIndexed(Integer, _Lshl(OpSize::i32Bit, Top, Constant(1)), OpSize::i64Bit, offsetof(Core::CpuStateFrame, x87_exact_int), 8);
++  return _Or(OpSize::i32Bit, Mask, _Lshl(OpSize::i32Bit, Valid, Top));
++}
++
++// madeira-bcd x87-exact: added }
+ void OpDispatchBuilder::SetX87FTW(Ref FTW) {
+   _StackForceSlow(); // Invalidate x87 FTW register cache
++  if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++    _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(FEXCore::Core::CpuStateFrame, x87_exact_valid));
++  } // madeira-bcd x87-exact: end
+ 
+   // For the output, we want a 1-bit for each pair not equal to 11 (Empty).
+   static_assert(static_cast<uint8_t>(FPState::X87Tag::Empty) == 0b11);
+@@ -520,7 +567,11 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
+   for (int i = 0; i < 7; ++i) {
+     Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+     if (ReducedPrecisionMode) {
+-      data = _F80CVTTo(data, OpSize::i64Bit);
++      if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++        data = SaveReducedX87Value(Top, data);
++      } else { // madeira-bcd x87-exact: off
++        data = _F80CVTTo(data, OpSize::i64Bit);
++      } // madeira-bcd x87-exact: end
+     }
+     _StoreMemFPR(OpSize::i128Bit, data, Mem, Constant((IR::OpSizeToSize(Size) * 7) + (10 * i)), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+     Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
+@@ -529,7 +580,11 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
+   // The final st(7) needs a bit of special handling here
+   Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+   if (ReducedPrecisionMode) {
+-    data = _F80CVTTo(data, OpSize::i64Bit);
++    if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++      data = SaveReducedX87Value(Top, data);
++    } else { // madeira-bcd x87-exact: off
++      data = _F80CVTTo(data, OpSize::i64Bit);
++    } // madeira-bcd x87-exact: end
+   }
+   // ST7 broken in to two parts
+   // Lower 64bits [63:0]
+@@ -572,11 +627,18 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
+   auto high = Constant(0xFFFF);
+   Ref Mask = _VLoadTwoGPRs(low, high);
+   const auto StoreSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
++  Ref ExactMask {}; // madeira-bcd x87-exact: added
++  if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++    ExactMask = Constant(0);
++  } // madeira-bcd x87-exact: end
+   for (int i = 0; i < 7; ++i) {
+     Ref Reg = _LoadMemFPR(OpSize::i128Bit, Mem, Constant((IR::OpSizeToSize(Size) * 7) + (10 * i)), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+     // Mask off the top bits
+     Reg = _VAnd(OpSize::i128Bit, OpSize::i128Bit, Reg, Mask);
+     if (ReducedPrecisionMode) {
++      if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++        ExactMask = RestoreReducedX87Value(Top, Reg, ExactMask);
++      } // madeira-bcd x87-exact: end
+       // Convert to double precision
+       Reg = _F80CVT(OpSize::i64Bit, Reg);
+     }
+@@ -593,7 +655,13 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
+   Ref RegHigh = _LoadMemFPR(OpSize::i16Bit, Mem, Constant((IR::OpSizeToSize(Size) * 7) + (10 * 7) + 8), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+   Reg = _VInsElement(OpSize::i128Bit, OpSize::i16Bit, 4, 0, Reg, RegHigh);
+   if (ReducedPrecisionMode) {
++    if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++      ExactMask = RestoreReducedX87Value(Top, Reg, ExactMask);
++    } // madeira-bcd x87-exact: end
+     Reg = _F80CVT(OpSize::i64Bit, Reg); // Convert to double precision
++    if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++      _StoreContextGPR(OpSize::i32Bit, ExactMask, offsetof(Core::CpuStateFrame, x87_exact_valid));
++    } // madeira-bcd x87-exact: end
+   }
+   _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+ }
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+index 39ba02a..4ed5e72 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+@@ -99,7 +99,13 @@ void OpDispatchBuilder::FILDF64(OpcodeArgs) {
+     Data = _Sbfe(OpSize::i64Bit, IR::OpSizeAsBits(ReadWidth), 0, Data);
+   }
+   auto ConvertedData = _Float_FromGPR_S(OpSize::i64Bit, ReadWidth == OpSize::i32Bit ? OpSize::i32Bit : OpSize::i64Bit, Data);
+-  _PushStack(ConvertedData, Invalid(), OpSize::iInvalid);
++  if (FPState::X87ExactInt64() && ReadWidth == OpSize::i64Bit) { // madeira-bcd x87-exact: on
++    // A double holds only 53 bits: keep the integer, so that a FISTP m64 of the unchanged value
++    // stores it exactly, as 32-bit MSVC's atomic 64-bit load (fild m64; fistp m64) needs.
++    _PushStackFromInt64(ConvertedData, _VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, Data));
++  } else { // madeira-bcd x87-exact: off
++    _PushStack(ConvertedData, Invalid(), OpSize::iInvalid);
++  } // madeira-bcd x87-exact: end
+ }
+ 
+ void OpDispatchBuilder::FISTF64(OpcodeArgs, bool Truncate) {
+@@ -114,6 +120,10 @@ void OpDispatchBuilder::FISTF64(OpcodeArgs, bool Truncate) {
+     } else {
+       data = _Vector_FToS(OpSize::i128Bit, OpSize::i64Bit, data);
+     }
++    if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++      // The integer of an unchanged FILD m64, which the conversion would round.
++      data = _ReadStackInt64(data);
++    } // madeira-bcd x87-exact: end
+     StoreResultFPR_WithOpSize(Op, Op->Dest, data, OpSize::i64Bit, OpSize::i8Bit);
+   } else {
+     if (Truncate) {
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index f978166..64eda6c 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -2877,6 +2877,14 @@
+         "HasSideEffects": true,
+         "X87": true
+       },
++      "PushStackFromInt64 FPR:$X80Src, FPR:$Int64Value": {
++        "Desc": [
++          "Reduced precision only: pushes X80Src, the 64-bit float converted from the 64-bit integer Int64Value, on to the x87 stack.",
++          "Allows ReadStackInt64 to return Int64Value exactly when its unchanged provenance is known within the translated block."
++        ],
++        "HasSideEffects": true,
++        "X87": true
++      },
+       "CopyPushStack u8:$StackLocation": {
+         "Desc": [
+           "Pushes an element already on the stack onto the top."
+@@ -2917,6 +2925,15 @@
+         "DestSize": "OpSize::i128Bit",
+         "X87": true
+       },
++      "FPR = ReadStackInt64 FPR:$Converted": {
++        "Desc": [
++          "Reduced precision only: the 64-bit integer for a FIST of the top of the stack.",
++          "If the unchanged PushStackFromInt64 provenance is known within this block, its Int64Value, which a 64-bit float may not hold exactly;",
++          "otherwise Converted, the top converted to a 64-bit integer."
++        ],
++        "DestSize": "OpSize::i64Bit",
++        "X87": true
++      },
+       "GPR = StackValidTag u8:$StackLocation": {
+         "Desc": [
+           "Returns 1 if the value in location TOP+$StackLocation is valid, 0 otherwise."
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index f62a9b2..99d73b7 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -13,6 +13,8 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <stdint.h>
++#include <utility> // madeira-bcd x87-exact: added
++#include <FEXCore/Utils/FPState.h> // madeira-bcd x87-exact: added (X87ExactInt64)
+ 
+ // This file adds a pass to process X87 stack instructions.
+ // These instructions are marked in IR.json with `X87: true` and are generated
+@@ -288,6 +290,7 @@ private:
+   Ref GetOffsetTopAddressWithCache_Slow(uint8_t Offset);
+   void SetTopWithCache_Slow(Ref Value);
+   Ref GetX87ValidTag_Slow(uint8_t Offset);
++  std::pair<Ref, Ref> LoadExactInt_Slow(uint8_t Offset); // madeira-bcd x87-exact: added
+   // Resets fields to initial values
+   void Reset();
+ 
+@@ -310,6 +313,12 @@ private:
+     // Tuple is only valid if we have information about the Source of the Stack Data Node.
+     // In it's valid then OpSize is the original source size and Ref is the original source node.
+     std::optional<StackMemberData> Source {};
++    // madeira-bcd x87-exact: added {
++
++    // Reduced precision: the 64-bit integer (in an FPR) that a FILD m64 converted to StackDataNode,
++    // which a double may not hold exactly. Null unless pushed by PushStackFromInt64.
++    Ref Int64Source {};
++    // madeira-bcd x87-exact: added }
+   };
+ 
+   // StackData, TopCache need to be always properly set to ensure
+@@ -348,6 +357,12 @@ private:
+   std::array<Ref, 8> TopOffsetCache {};
+   std::array<Ref, 8> TopOffsetAddressCache {};
+   std::array<Ref, 8> TopValueCache {};
++  // madeira-bcd x87-exact: added {
++  // Reduced precision: exact FILD m64 integer while its source is known in this block.
++  // Both stay null with the switch off: nothing fills them, and they are read only behind it.
++  std::array<Ref, 8> TopInt64Cache {};
++  std::array<Ref, 8> TopInt64ValidCache {};
++  // madeira-bcd x87-exact: added }
+   std::array<StackSlot, 8> TopValidCache {};
+ 
+   // Are we on the slow path?
+@@ -375,6 +390,8 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
+   TopOffsetCache.fill(nullptr);
+   TopOffsetAddressCache.fill(nullptr);
+   TopValueCache.fill(nullptr);
++  TopInt64Cache.fill(nullptr); // madeira-bcd x87-exact: added
++  TopInt64ValidCache.fill(nullptr); // madeira-bcd x87-exact: added
+   TopValidCache.fill(StackSlot::UNUSED);
+ }
+ 
+@@ -458,6 +475,10 @@ inline Ref X87StackOptimization::GetFTW() {
+ 
+ inline void X87StackOptimization::SetX87ValidTag(uint8_t Offset, bool Valid) {
+   TopValidCache[Offset] = Valid ? StackSlot::VALID : StackSlot::INVALID;
++  if (FPState::X87ExactInt64() && !Valid) { // madeira-bcd x87-exact: on
++    TopInt64Cache[Offset] = nullptr;
++    TopInt64ValidCache[Offset] = nullptr;
++  } // madeira-bcd x87-exact: end
+   FlushValidPending = true;
+ }
+ 
+@@ -470,6 +491,27 @@ inline Ref X87StackOptimization::GetX87ValidTag_Slow(uint8_t Offset) {
+   }
+ }
+ 
++// madeira-bcd x87-exact: added {
++// The exact integer of the slot and whether it is the slot's value, or nothing. Called only with the switch on; it emits
++// nothing and answers nothing without it.
++inline std::pair<Ref, Ref> X87StackOptimization::LoadExactInt_Slow(uint8_t Offset) {
++  if (!ReducedPrecisionMode || !FPState::X87ExactInt64()) return {};
++  if (TopInt64Cache[Offset]) return {TopInt64Cache[Offset], TopInt64ValidCache[Offset]};
++  if (FlushValuesPending[Offset]) return {};
++  Ref Top = GetOffsetTopWithCache_Slow(Offset);
++  Ref Mask = IREmit->_LoadContextGPR(OpSize::i32Bit, offsetof(Core::CpuStateFrame, x87_exact_valid));
++  Ref Bit = IREmit->_And(OpSize::i32Bit, IREmit->_Lshr(OpSize::i32Bit, Mask, Top), GetConstant(1));
++  Ref Valid = IREmit->_And(OpSize::i32Bit, Bit, GetX87ValidTag_Slow(Offset));
++  Ref Address = GetOffsetTopAddressWithCache_Slow(Offset);
++  Ref Exact = IREmit->_LoadMemHostFPR(OpSize::i64Bit, Address,
++                                      IREmit->_InlineConstant(offsetof(Core::CpuStateFrame, x87_exact_int)),
++                                      OpSize::i64Bit, MemOffsetType::SXTX, 1);
++  TopInt64Cache[Offset] = Exact;
++  TopInt64ValidCache[Offset] = Valid;
++  return {Exact, Valid};
++}
++
++// madeira-bcd x87-exact: added }
+ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
+   OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
+   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+@@ -484,6 +526,8 @@ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
+ 
+ inline void X87StackOptimization::StoreStackValueAtOffset_Slow(Ref Value, uint8_t Offset, bool SetValid) {
+   TopValueCache[Offset] = Value;
++  TopInt64Cache[Offset] = nullptr; // madeira-bcd x87-exact: added
++  TopInt64ValidCache[Offset] = nullptr; // madeira-bcd x87-exact: added
+   FlushValuesPending[Offset] = true;
+   // mark it valid
+   // In some cases we might already know it has been previously set as valid so we don't need to do it again
+@@ -584,6 +628,8 @@ inline void X87StackOptimization::UpdateTopForPop_Slow() {
+   std::rotate(TopOffsetCache.begin(), std::next(TopOffsetCache.begin()), TopOffsetCache.end());
+   std::rotate(TopOffsetAddressCache.begin(), std::next(TopOffsetAddressCache.begin()), TopOffsetAddressCache.end());
+   std::rotate(TopValueCache.begin(), std::next(TopValueCache.begin()), TopValueCache.end());
++  std::rotate(TopInt64Cache.begin(), std::next(TopInt64Cache.begin()), TopInt64Cache.end()); // madeira-bcd x87-exact: added
++  std::rotate(TopInt64ValidCache.begin(), std::next(TopInt64ValidCache.begin()), TopInt64ValidCache.end()); // madeira-bcd x87-exact: added
+   std::rotate(FlushValuesPending.begin(), std::next(FlushValuesPending.begin()), FlushValuesPending.end());
+   std::rotate(TopValidCache.begin(), std::next(TopValidCache.begin()), TopValidCache.end());
+   FlushTopPending = true;
+@@ -595,6 +641,8 @@ inline void X87StackOptimization::UpdateTopForPush_Slow() {
+   std::rotate(TopOffsetCache.begin(), std::prev(TopOffsetCache.end()), TopOffsetCache.end());
+   std::rotate(TopOffsetAddressCache.begin(), std::prev(TopOffsetAddressCache.end()), TopOffsetAddressCache.end());
+   std::rotate(TopValueCache.begin(), std::prev(TopValueCache.end()), TopValueCache.end());
++  std::rotate(TopInt64Cache.begin(), std::prev(TopInt64Cache.end()), TopInt64Cache.end()); // madeira-bcd x87-exact: added
++  std::rotate(TopInt64ValidCache.begin(), std::prev(TopInt64ValidCache.end()), TopInt64ValidCache.end()); // madeira-bcd x87-exact: added
+   std::rotate(FlushValuesPending.begin(), std::prev(FlushValuesPending.end()), FlushValuesPending.end());
+   std::rotate(TopValidCache.begin(), std::prev(TopValidCache.end()), TopValidCache.end());
+   FlushTopPending = true;
+@@ -607,17 +655,35 @@ void X87StackOptimization::FlushCachedRegs() {
+   }
+ 
+   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
++  Ref ExactMask {}; // madeira-bcd x87-exact: added
+   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
+     if (FlushValuesPending[i]) {
+       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
+       // Host-addressed, see LoadStackValueAtOffset_Slow.
+       IREmit->_StoreMemHostFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
+                                MemOffsetType::SXTX, 1);
++      if (FPState::X87ExactInt64() && ReducedPrecisionMode) { // madeira-bcd x87-exact: on
++        if (!ExactMask) {
++          ExactMask = IREmit->_LoadContextGPR(OpSize::i32Bit, offsetof(Core::CpuStateFrame, x87_exact_valid));
++        }
++        Ref Bit = IREmit->_Lshl(OpSize::i32Bit, GetConstant(1), GetOffsetTopWithCache_Slow(i));
++        ExactMask = IREmit->_Andn(OpSize::i32Bit, ExactMask, Bit);
++        if (TopInt64Cache[i]) {
++          IREmit->_StoreMemHostFPR(OpSize::i64Bit, TopInt64Cache[i], TopOffsetAddress,
++                                   IREmit->_InlineConstant(offsetof(Core::CpuStateFrame, x87_exact_int)), OpSize::i64Bit,
++                                   MemOffsetType::SXTX, 1);
++          Ref ValidBit = IREmit->_Lshl(OpSize::i32Bit, TopInt64ValidCache[i], GetOffsetTopWithCache_Slow(i));
++          ExactMask = IREmit->_Or(OpSize::i32Bit, ExactMask, ValidBit);
++        }
++      } // madeira-bcd x87-exact: end
+       // store
+       FlushValuesPending[i] = false;
+     }
+   }
+ 
++  if (FPState::X87ExactInt64() && ExactMask) { // madeira-bcd x87-exact: on
++    IREmit->_StoreContextGPR(OpSize::i32Bit, ExactMask, offsetof(Core::CpuStateFrame, x87_exact_valid));
++  } // madeira-bcd x87-exact: end
+   if (FlushValidPending) {
+     uint8_t ValidMask = 0;
+     uint8_t InvalidMask = 0;
+@@ -698,6 +764,10 @@ Ref X87StackOptimization::SynchronizeStackValues() {
+ 
+     if (Valid == StackSlot::VALID) {
+       StoreStackValueAtOffset_Slow(StackMember.StackDataNode, i, false);
++      if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++        TopInt64Cache[i] = StackMember.Int64Source;
++        TopInt64ValidCache[i] = StackMember.Int64Source ? GetConstant(1) : nullptr;
++      } // madeira-bcd x87-exact: end
+     }
+   }
+   { // Set valid tags
+@@ -920,6 +990,8 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         } else { // invalidate all
+           if (SlowPath) {
+             TopValidCache.fill(StackSlot::INVALID);
++            TopInt64Cache.fill(nullptr); // madeira-bcd x87-exact: added
++            TopInt64ValidCache.fill(nullptr); // madeira-bcd x87-exact: added
+             FlushValidPending = true;
+           } else {
+             for (size_t i = 0; i < StackData.size; i++) {
+@@ -950,6 +1022,26 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         break;
+       }
+ 
++      // madeira-bcd x87-exact: added {
++      // FILDF64 emits this operation only with the switch on.
++      case OP_PUSHSTACKFROMINT64: {
++        const auto* Op = IROp->C<IROp_PushStackFromInt64>();
++        auto* SourceNode = CurrentIR.GetNode(Op->X80Src);
++
++        if (SlowPath) {
++          UpdateTopForPush_Slow();
++          StoreStackValueAtOffset_Slow(SourceNode);
++          TopInt64Cache[0] = CurrentIR.GetNode(Op->Int64Value);
++          TopInt64ValidCache[0] = GetConstant(1);
++        } else {
++          StackMemberInfo Member {SourceNode};
++          Member.Int64Source = CurrentIR.GetNode(Op->Int64Value);
++          StackData.push(Member);
++        }
++        break;
++      }
++
++      // madeira-bcd x87-exact: added }
+       case OP_COPYPUSHSTACK: {
+         const auto* Op = IROp->C<IROp_CopyPushStack>();
+         auto Offset = Op->StackLocation;
+@@ -957,8 +1049,11 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+         if (SlowPath) {
+           Ref St0 = LoadStackValueAtOffset_Slow(Offset);
++          auto [Exact, Valid] = LoadExactInt_Slow(Offset); // madeira-bcd x87-exact: added (nothing, and nothing emitted, with the switch off)
+           UpdateTopForPush_Slow();
+           StoreStackValueAtOffset_Slow(St0);
++          TopInt64Cache[0] = Exact; // madeira-bcd x87-exact: added
++          TopInt64ValidCache[0] = Valid; // madeira-bcd x87-exact: added
+         } else {
+           StackData.push(*Value);
+         }
+@@ -974,6 +1069,33 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         break;
+       }
+ 
++      // madeira-bcd x87-exact: added {
++      // FISTF64 emits this operation only with the switch on.
++      case OP_READSTACKINT64: {
++        // FIST m64 of the top. While the top is the unchanged value of a FILD m64 (moved only by
++        // FXCH, FLD ST(i) or FST ST(i)), store the loaded integer rather than the rounded double.
++        const auto* Op = IROp->C<IROp_ReadStackInt64>();
++        Ref Result = CurrentIR.GetNode(Op->Converted);
++        if (!SlowPath) {
++          const auto& [Valid, StackMember] = StackData.top(0);
++          if (Valid == StackSlot::VALID && StackMember.Int64Source) {
++            Result = StackMember.Int64Source;
++          }
++        } else {
++          auto [Exact, Valid] = LoadExactInt_Slow(0);
++          if (Exact) {
++            Ref ExactGPR = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Exact, 0);
++            Ref Converted = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Result, 0);
++            Ref Selected = IREmit->_Select(OpSize::i64Bit, OpSize::i32Bit, CondClass::NEQ, Valid, GetConstant(0), ExactGPR, Converted);
++            Result = IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, Selected);
++          }
++        }
++
++        IREmit->ReplaceUsesWithAfter(CodeNode, Result, CodeNode);
++        break;
++      }
++
++      // madeira-bcd x87-exact: added }
+       case OP_STACKVALIDTAG: {
+         // Returns 0 if value is valid and 1 otherwise.
+         const auto* Op = IROp->C<IROp_StackValidTag>();
+@@ -1041,7 +1163,15 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+           // Need to store st0 to stack location - basically a copy.
+           if (SlowPath) {
+-            StoreStackValueAtOffset_Slow(LoadStackValueAtOffset_Slow(), Offset);
++            if (FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++              Ref Value = LoadStackValueAtOffset_Slow();
++              auto [Exact, Valid] = LoadExactInt_Slow(0);
++              StoreStackValueAtOffset_Slow(Value, Offset);
++              TopInt64Cache[Offset] = Exact;
++              TopInt64ValidCache[Offset] = Valid;
++            } else { // madeira-bcd x87-exact: off
++              StoreStackValueAtOffset_Slow(LoadStackValueAtOffset_Slow(), Offset);
++            } // madeira-bcd x87-exact: end
+           } else {
+             StackData.setTop(*Value, Offset);
+           }
+@@ -1072,8 +1202,14 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+           // Slow path: do actual memory operations
+           Ref ValueTop = LoadStackValue();
+           Ref ValueOffset = LoadStackValue(Offset);
++          auto [ExactTop, ValidTop] = LoadExactInt_Slow(0); // madeira-bcd x87-exact: added (nothing, and nothing emitted, with the switch off)
++          auto [ExactOffset, ValidOffset] = LoadExactInt_Slow(Offset); // madeira-bcd x87-exact: added
+           StoreStackValue(ValueOffset);
+           StoreStackValue(ValueTop, Offset);
++          TopInt64Cache[0] = ExactOffset; // madeira-bcd x87-exact: added
++          TopInt64ValidCache[0] = ValidOffset; // madeira-bcd x87-exact: added
++          TopInt64Cache[Offset] = ExactTop; // madeira-bcd x87-exact: added
++          TopInt64ValidCache[Offset] = ValidTop; // madeira-bcd x87-exact: added
+         } else {
+           // Fast path: swap complete StackMemberInfo preserving Source metadata
+           StackData.setTop(StackMemberOffset, 0);
+diff --git a/FEXCore/Source/Utils/Allocator.cpp b/FEXCore/Source/Utils/Allocator.cpp
+index 22e6cf0..9e3cfd5 100644
+--- a/FEXCore/Source/Utils/Allocator.cpp
++++ b/FEXCore/Source/Utils/Allocator.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ #include "Utils/Allocator/HostAllocator.h"
++#include "Utils/Allocator.h"
+ #include <FEXCore/Utils/Allocator.h>
+ #include <FEXCore/Utils/CompilerDefs.h>
+ #include <FEXCore/Utils/LogManager.h>
+diff --git a/FEXCore/Source/Utils/FPState.cpp b/FEXCore/Source/Utils/FPState.cpp
+new file mode 100644
+index 0000000..1645030
+--- /dev/null
++++ b/FEXCore/Source/Utils/FPState.cpp
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: MIT
++#include <FEXCore/Utils/FPState.h>
++#include <FEXCore/Core/CoreState.h>
++#include <FEXCore/Utils/LogManager.h>
++#include <bit>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++extern "C" {
++#include "SoftFloat-3e/platform.h"
++#include "SoftFloat-3e/softfloat.h"
++}
++
++namespace FEXCore::FPState {
++static softfloat_state StateFromControlWord(uint16_t FCW) {
++  softfloat_state State {};
++  State.detectTininess = softfloat_tininess_afterRounding;
++  State.roundingPrecision = 80;
++  constexpr uint8_t Modes[] = {softfloat_round_near_even, softfloat_round_min, softfloat_round_max, softfloat_round_minMag};
++  State.roundingMode = Modes[(FCW >> 10) & 3];
++  return State;
++}
++
++// madeira-bcd x87-exact: see FPState.h. Exactly "1" turns it on; one line says so.
++bool X87ExactInt64() {
++  static const bool On = [] {
++    const char* Env = getenv("MADEIRA_FEX_X87_EXACT_INT64");
++    const bool Value = Env && Env[0] == '1' && Env[1] == '\0';
++    if (Value) {
++      LogMan::Msg::IFmt("[fex-x87-exact] MADEIRA_FEX_X87_EXACT_INT64=1: reduced-precision x87 keeps the 64-bit integer of FILD m64 for FISTP m64");
++    }
++    return Value;
++  }();
++  return On;
++}
++
++void ExportX87Register(const FEXCore::Core::CpuStateFrame& Frame, unsigned Slot, uint64_t (&Out)[2], bool Reduced) {
++  const auto& State = Frame.State;
++  if (!Reduced) {
++    memcpy(Out, State.mm[Slot], sizeof(Out));
++    return;
++  }
++  extFloat80_t Value {};
++  if ((Frame.x87_exact_valid & State.AbridgedFTW) & (1u << Slot)) {
++    const uint64_t Bits = Frame.x87_exact_int[Slot][0];
++    const bool Negative = (Bits >> 63) != 0;
++    Value = ui64_to_extF80(Negative ? 0 - Bits : Bits);
++    if (Negative) Value.signExp |= 0x8000;
++  } else {
++    auto FloatState = StateFromControlWord(State.FCW);
++    Value = f64_to_extF80(&FloatState, std::bit_cast<float64_t>(State.mm[Slot][0]));
++  }
++  Out[0] = Value.signif;
++  Out[1] = Value.signExp;
++}
++
++void ImportX87Register(FEXCore::Core::CpuStateFrame& Frame, unsigned Slot, const uint64_t (&In)[2], bool Reduced) {
++  auto& State = Frame.State;
++  Frame.x87_exact_valid &= ~(1u << Slot);
++  if (!Reduced) {
++    memcpy(State.mm[Slot], In, sizeof(In));
++    return;
++  }
++  extFloat80_t Value {};
++  Value.signif = In[0];
++  Value.signExp = static_cast<uint16_t>(In[1]);
++  auto FloatState = StateFromControlWord(State.FCW);
++  State.mm[Slot][0] = std::bit_cast<uint64_t>(extF80_to_f64(&FloatState, Value));
++
++  const uint64_t Exponent = Value.signExp & 0x7fff;
++  const bool Negative = Value.signExp & 0x8000;
++  if (Exponent < 0x3fff || Exponent > 0x403e || !(Value.signif >> 63)) return;
++  const unsigned Shift = 0x403e - Exponent;
++  const uint64_t Magnitude = Value.signif >> Shift;
++  if ((Magnitude << Shift) != Value.signif ||
++      (Exponent == 0x403e && (!Negative || Value.signif != (1ULL << 63)))) return;
++  Frame.x87_exact_int[Slot][0] = Negative ? 0 - Magnitude : Magnitude;
++  Frame.x87_exact_valid |= 1u << Slot;
++}
++} // namespace FEXCore::FPState
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index bd11b42..2024200 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -513,7 +513,31 @@ struct CpuStateFrame {
+    * null when the ring is off. Published to the thread's TEB at 0x1710 (the
+    * ActivityId field, unused by Wine) so the fault reporters can dump it. */
+   uint64_t* IosBlockRing {};
++  // madeira-bcd x87-exact: added {
++
++  /* madeira-bcd x87-exact (env MADEIRA_FEX_X87_EXACT_INT64=1, default off; FEXCore::FPState::X87ExactInt64): reduced-precision
++   * x87 keeps the 64-bit integer of a FILD m64 beside the double it became, so that a FISTP m64 of the unchanged value stores
++   * it exactly (x87_exact_int[physical slot][0]; bit <physical slot> of x87_exact_valid says the integer is the slot's value).
++   * Madeira's fork keeps these two at the end of CPUState, which moves every member of this frame after State by 192 bytes
++   * (the JIT pointer table, the offsets ARM64EC/Module.S reads). Here they are appended after all existing fields instead:
++   * no offset of CPUState or of this frame moves, so with the switch off the JIT emits what it emitted before. They are read
++   * and written only with the switch on.
++   * shortcut: ARM64EC context conversions lose provenance, upgrade when they preserve full x87 values.
++   * Kept separate from ARM64EC's mm state. */
++  alignas(16) uint64_t x87_exact_int[8][2] {};
++  uint32_t x87_exact_valid {};
++  // madeira-bcd x87-exact: added }
+ };
++// madeira-bcd x87-exact: added {
++// The JIT addresses both from STATE (LoadContext / StoreContext immediates; a release build does not check the range): a
++// 32-bit access reaches 16380, a 64-bit one 32760.
++static_assert(offsetof(CpuStateFrame, State) == 0, "STATE is the frame and the CPU state");
++static_assert(offsetof(CpuStateFrame, x87_exact_valid) % 4 == 0 && offsetof(CpuStateFrame, x87_exact_valid) <= 16380,
++              "x87_exact_valid must be in LoadContext's 32-bit immediate range");
++static_assert(offsetof(CpuStateFrame, x87_exact_int) % 16 == 0 &&
++                offsetof(CpuStateFrame, x87_exact_int) + sizeof(CpuStateFrame::x87_exact_int) <= 32760,
++              "x87_exact_int must be in the 64-bit immediate range");
++// madeira-bcd x87-exact: added }
+ 
+ #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+ extern uint32_t IosGuestBranchTraceEnabled;
+diff --git a/FEXCore/include/FEXCore/Utils/FPState.h b/FEXCore/include/FEXCore/Utils/FPState.h
+index 824f3c5..b3e2438 100644
+--- a/FEXCore/include/FEXCore/Utils/FPState.h
++++ b/FEXCore/include/FEXCore/Utils/FPState.h
+@@ -2,8 +2,26 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <FEXCore/Utils/CompilerDefs.h> // madeira-bcd x87-exact: added
++// madeira-bcd x87-exact: added {
++
++namespace FEXCore::Core { struct CpuStateFrame; }
++// madeira-bcd x87-exact: added }
+ 
+ namespace FEXCore::FPState {
++// madeira-bcd x87-exact: added {
++// The switch of the exact 64-bit integer transfers in reduced-precision x87 (FILD m64 ... FISTP m64), and of everything that
++// came with them (the x87 registers of FXSAVE / FNSAVE images and of WOW64 and signal contexts in the architectural 80-bit
++// format, FXRSTOR by TOP). On only when env MADEIRA_FEX_X87_EXACT_INT64 is exactly "1"; read once. Off (the default): the
++// dispatcher, the x87 pass and the context code do what they did before these changes, statement for statement.
++FEX_DEFAULT_VISIBILITY bool X87ExactInt64();
++
++// These conversions use caller-owned SoftFloat state and are safe in signal handlers.
++// They take the frame, where the integers are kept (see CoreState.h), not the CPU state.
++FEX_DEFAULT_VISIBILITY void ExportX87Register(const FEXCore::Core::CpuStateFrame& Frame, unsigned Slot, uint64_t (&Out)[2], bool Reduced);
++FEX_DEFAULT_VISIBILITY void ImportX87Register(FEXCore::Core::CpuStateFrame& Frame, unsigned Slot, const uint64_t (&In)[2], bool Reduced);
++
++// madeira-bcd x87-exact: added }
+ enum class X87Tag : uint8_t { Valid = 0b00, Zero = 0b01, Special = 0b10, Empty = 0b11 };
+ 
+ static inline X87Tag GetX87Tag(uint64_t (&Reg)[2], bool Valid) {
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+index 9ba706c..8e66d5c 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+@@ -397,6 +397,7 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
+   // This state will be restored on rt_sigreturn
+   memset(Frame->State.xmm.avx.data, 0, sizeof(Frame->State.xmm));
+   memset(Frame->State.mm, 0, sizeof(Frame->State.mm));
++  Frame->x87_exact_valid = 0; // madeira-bcd x87-exact: the mask is in the frame
+   Frame->State.FCW = 0x37F;
+   Frame->State.AbridgedFTW = 0;
+ 
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.h b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.h
+index bfaa372..3748108 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.h
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.h
+@@ -107,6 +107,7 @@ public:
+   void QueueSignal(pid_t tgid, pid_t tid, int Signal, siginfo_t* info, bool IgnoreMask);
+ 
+   FEXCore::Context::Context* CTX;
++  FEX_CONFIG_OPT(ReducedX87, X87REDUCEDPRECISION);
+ 
+   void SetVDSOSymbols() {
+     // Get symbols from VDSO.
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
+index 2401fe4..3264be7 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
+@@ -200,7 +200,13 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
+     const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+     for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+       const auto modulo_i = (i + CurrentOffset) % 8;
+-      memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
++      if (ReducedX87 && FEXCore::FPState::X87ExactInt64()) { // madeira-bcd x87-exact: only with the switch on
++        uint64_t Saved[2] {};
++        memcpy(Saved, &fpstate->_st[i], sizeof(Saved));
++        FEXCore::FPState::ImportX87Register(*Frame, modulo_i, Saved, true);
++      } else {
++        memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
++      }
+     }
+   }
+ }
+@@ -278,7 +284,13 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
+     for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+       // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
+       const auto modulo_i = (i + CurrentOffset) % 8;
+-      memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
++      if (ReducedX87 && FEXCore::FPState::X87ExactInt64()) { // madeira-bcd x87-exact: only with the switch on
++        uint64_t Saved[2] {};
++        memcpy(Saved, &fpstate->_st[i], 10);
++        FEXCore::FPState::ImportX87Register(*Frame, modulo_i, Saved, true);
++      } else {
++        memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
++      }
+     }
+   }
+ }
+@@ -357,7 +369,13 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
+     for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+       // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
+       const auto modulo_i = (i + CurrentOffset) % 8;
+-      memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
++      if (ReducedX87 && FEXCore::FPState::X87ExactInt64()) { // madeira-bcd x87-exact: only with the switch on
++        uint64_t Saved[2] {};
++        memcpy(Saved, &fpstate->_st[i], 10);
++        FEXCore::FPState::ImportX87Register(*Frame, modulo_i, Saved, true);
++      } else {
++        memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
++      }
+     }
+   }
+ }
+@@ -472,7 +490,9 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
+   const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+   for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+     const auto modulo_i = (i + CurrentOffset) % 8;
+-    memcpy(&fpstate->_st[i], &Frame->State.mm[modulo_i], sizeof(Frame->State.mm[0]));
++    uint64_t Saved[2] {};
++    FEXCore::FPState::ExportX87Register(*Frame, modulo_i, Saved, ReducedX87 && FEXCore::FPState::X87ExactInt64()); // madeira-bcd x87-exact: a plain copy without the switch
++    memcpy(&fpstate->_st[i], Saved, sizeof(Saved));
+   }
+ 
+   if (SupportsAVX) {
+@@ -593,10 +613,11 @@ uint64_t SignalDelegator::SetupFrame_ia32(FEXCore::Core::InternalThreadState* Th
+ 
+   // Copy float registers
+   const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
++  uint64_t Saved[8][2] {};
+   for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+     const auto modulo_i = (i + CurrentOffset) % 8;
+-    // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
+-    memcpy(&fpstate->_st[i], &Frame->State.mm[modulo_i], 10);
++    FEXCore::FPState::ExportX87Register(*Frame, modulo_i, Saved[i], ReducedX87 && FEXCore::FPState::X87ExactInt64()); // madeira-bcd x87-exact: a plain copy without the switch
++    memcpy(&fpstate->_st[i], Saved[i], 10);
+   }
+ 
+   // Extended XMM state
+@@ -616,7 +637,7 @@ uint64_t SignalDelegator::SetupFrame_ia32(FEXCore::Core::InternalThreadState* Th
+   fpstate->fsw = (Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
+                  (Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] << 9) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] << 10) |
+                  (Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] << 14) | Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC];
+-  fpstate->ftw = FEXCore::FPState::ConvertFromAbridgedFTW(fpstate->fsw, Frame->State.mm, Frame->State.AbridgedFTW);
++  fpstate->ftw = FEXCore::FPState::ConvertFromAbridgedFTW(fpstate->fsw, Saved, Frame->State.AbridgedFTW);
+ 
+   // Curiously non-rt signals don't support altstack. So that state doesn't exist here.
+ 
+@@ -730,10 +751,11 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState*
+ 
+   // Copy float registers
+   const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
++  uint64_t Saved[8][2] {};
+   for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+     const auto modulo_i = (i + CurrentOffset) % 8;
+-    // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
+-    memcpy(&fpstate->_st[i], &Frame->State.mm[modulo_i], 10);
++    FEXCore::FPState::ExportX87Register(*Frame, modulo_i, Saved[i], ReducedX87 && FEXCore::FPState::X87ExactInt64()); // madeira-bcd x87-exact: a plain copy without the switch
++    memcpy(&fpstate->_st[i], Saved[i], 10);
+   }
+ 
+   // Extended XMM state
+@@ -753,7 +775,7 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState*
+   fpstate->fsw = (Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
+                  (Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] << 9) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] << 10) |
+                  (Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] << 14) | Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC];
+-  fpstate->ftw = FEXCore::FPState::ConvertFromAbridgedFTW(fpstate->fsw, Frame->State.mm, Frame->State.AbridgedFTW);
++  fpstate->ftw = FEXCore::FPState::ConvertFromAbridgedFTW(fpstate->fsw, Saved, Frame->State.AbridgedFTW);
+ 
+   // Copy over signal stack information
+   guest_uctx->uc.uc_stack.ss_flags = GuestStack->ss_flags;
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 063912c..b9a986e 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -597,6 +597,9 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+       CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
+     }
+     memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
++    if (FEXCore::FPState::X87ExactInt64()) { // madeira-bcd x87-exact: on
++      Thread->CurrentFrame->x87_exact_valid = 0; // the registers were replaced
++    } // madeira-bcd x87-exact: end
+ 
+     State.FCW = Context.FltSave.ControlWord;
+     State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = Context.FltSave.StatusWord & 1;
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index f85f3bb..428e630 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -592,6 +592,12 @@ namespace Context {
+ // in the JIT. `Context` itself is a HOST pointer (ntdll's CPU area, or a caller stack temporary);
+ // WowTEB is the GUEST TEB32 address, see GetWowTEB(). Applies to both directions and therefore to
+ // BTCpuGetContext/BTCpuSetContext, which only move whole WOW64_CONTEXTs through ntdll.
++// madeira-bcd x87-exact: added {
++// True only in reduced-precision x87 with MADEIRA_FEX_X87_EXACT_INT64=1 (set once in BTCpuProcessInit): the x87 registers of a
++// WOW64 context are then converted to and from the 80-bit format. False (the default): they are copied as they are, as before.
++static bool WowReducedX87 {};
++
++// madeira-bcd x87-exact: added }
+ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread, uint64_t WowTEB, WOW64_CONTEXT* Context) {
+   auto& State = Thread->CurrentFrame->State;
+ 
+@@ -630,7 +636,18 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread, uint64_
+   const auto* XSave = reinterpret_cast<XSAVE_FORMAT*>(Context->ExtendedRegisters);
+ 
+   CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(XSave->XmmRegisters), nullptr);
+-  memcpy(State.mm, XSave->FloatRegisters, sizeof(State.mm));
++  if (WowReducedX87) { // madeira-bcd x87-exact: on
++    // Every register is replaced: ImportX87Register drops each slot's integer and keeps it again only when the 80-bit value is one.
++    State.FCW = XSave->ControlWord; // the conversion rounds as the control word says
++    const unsigned Top = (XSave->StatusWord >> 11) & 7;
++    for (unsigned i = 0; i < 8; ++i) {
++      uint64_t Saved[2] {};
++      memcpy(Saved, &XSave->FloatRegisters[i], sizeof(Saved));
++      FEXCore::FPState::ImportX87Register(*Thread->CurrentFrame, (i + Top) & 7, Saved, true);
++    }
++  } else { // madeira-bcd x87-exact: off
++    memcpy(State.mm, XSave->FloatRegisters, sizeof(State.mm));
++  } // madeira-bcd x87-exact: end
+ 
+   State.FCW = XSave->ControlWord;
+   State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = XSave->StatusWord & 1;
+@@ -671,7 +688,16 @@ void StoreWowContextFromState(FEXCore::Core::InternalThreadState* Thread, WOW64_
+   auto* XSave = reinterpret_cast<XSAVE_FORMAT*>(Context->ExtendedRegisters);
+ 
+   CTX->ReconstructXMMRegisters(Thread, reinterpret_cast<__uint128_t*>(XSave->XmmRegisters), nullptr);
+-  memcpy(XSave->FloatRegisters, State.mm, sizeof(State.mm));
++  uint64_t SavedX87[8][2]; // madeira-bcd x87-exact: added (filled and read only with the switch on)
++  if (WowReducedX87) { // madeira-bcd x87-exact: on
++    const unsigned Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
++    for (unsigned i = 0; i < 8; ++i) {
++      FEXCore::FPState::ExportX87Register(*Thread->CurrentFrame, (i + Top) & 7, SavedX87[i], true);
++    }
++    memcpy(XSave->FloatRegisters, SavedX87, sizeof(SavedX87));
++  } else { // madeira-bcd x87-exact: off
++    memcpy(XSave->FloatRegisters, State.mm, sizeof(State.mm));
++  } // madeira-bcd x87-exact: end
+ 
+   XSave->ControlWord = State.FCW;
+   XSave->StatusWord = (State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
+@@ -681,7 +707,11 @@ void StoreWowContextFromState(FEXCore::Core::InternalThreadState* Thread, WOW64_
+ 
+   Context->FloatSave.ControlWord = XSave->ControlWord;
+   Context->FloatSave.StatusWord = XSave->StatusWord;
+-  Context->FloatSave.TagWord = FEXCore::FPState::ConvertFromAbridgedFTW(XSave->StatusWord, State.mm, XSave->TagWord);
++  if (WowReducedX87) { // madeira-bcd x87-exact: on
++    Context->FloatSave.TagWord = FEXCore::FPState::ConvertFromAbridgedFTW(XSave->StatusWord, SavedX87, XSave->TagWord);
++  } else { // madeira-bcd x87-exact: off
++    Context->FloatSave.TagWord = FEXCore::FPState::ConvertFromAbridgedFTW(XSave->StatusWord, State.mm, XSave->TagWord);
++  } // madeira-bcd x87-exact: end
+   Context->FloatSave.ErrorOffset = XSave->ErrorOffset;
+   Context->FloatSave.ErrorSelector = XSave->ErrorSelector | (XSave->ErrorOpcode << 16);
+   Context->FloatSave.DataOffset = XSave->DataOffset;
+@@ -1193,6 +1223,12 @@ void BTCpuProcessInit() {
+   if (!FEXCore::Config::Exists(FEXCore::Config::CONFIG_X87REDUCEDPRECISION)) {
+     FEXCore::Config::Set(FEXCore::Config::CONFIG_X87REDUCEDPRECISION, "1");
+   }
++  // madeira-bcd x87-exact: added {
++  {
++    FEX_CONFIG_OPT(ReducedX87, X87REDUCEDPRECISION);
++    Context::WowReducedX87 = ReducedX87 && FEXCore::FPState::X87ExactInt64();
++  }
++  // madeira-bcd x87-exact: added }
+ 
+   /* MADEIRA: StrictInProcessSplitLocks defaults ON for 32-bit guests.
+    *

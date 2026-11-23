@@ -1,0 +1,1648 @@
+diff --git a/dlls/combase/apartment.c b/dlls/combase/apartment.c
+index 85e06a6..72ecab4 100644
+--- a/dlls/combase/apartment.c
++++ b/dlls/combase/apartment.c
+@@ -23,6 +23,12 @@
+  *
+  */
+ 
++/*
++ * Modified by BCD, 2026-11-11 (tools/patch-wine-combase-implicit-mta.py): a thread with no COM state uses an MTA that is
++ * created on first need when no thread of the process made one (apartment_get_current_or_mta). Everything else in this file
++ * is as Wine's; this file stays under the license above.
++ */
++
+ #include <stdarg.h>
+ #include <assert.h>
+ 
+@@ -618,6 +624,25 @@ struct apartment * apartment_get_mta(void)
+     return apt;
+ }
+ 
++static const char madeira_implicit_mta_tag[] __attribute__((used)) = "combase-implicit-mta-v1 madeira-bcd";
++
++/* Modified by BCD: a thread that never initialised COM, in a process where no thread made an MTA, got CO_E_NOTINITIALIZED
++ * from every COM call that accepts an implicit MTA (Unreal Engine 5's FAsyncLoadingThread creating the audio device enumerator:
++ * the game does not check the result). The process's MTA is created here, the way CoIncrementMTAUsage does, with a usage
++ * cookie that is never released; nothing is attached to the calling thread. */
++static struct apartment *madeira_implicit_mta(void)
++{
++    CO_MTA_USAGE_COOKIE cookie;
++    static LONG logged;
++
++    if (FAILED(apartment_increment_mta_usage(&cookie)))
++        return NULL;
++    if (!InterlockedExchange(&logged, 1))
++        ERR("[com-mta] no thread of this process made an MTA: created it for thread %04lx (%s)\n",
++            GetCurrentThreadId(), madeira_implicit_mta_tag);
++    return apartment_get_mta();
++}
++
+ /* Return the current apartment if it exists, or, failing that, the MTA. Caller
+  * must free the returned apartment in either case. */
+ struct apartment * apartment_get_current_or_mta(void)
+@@ -628,7 +653,9 @@ struct apartment * apartment_get_current_or_mta(void)
+         apartment_addref(apt);
+         return apt;
+     }
+-    return apartment_get_mta();
++    if ((apt = apartment_get_mta()))
++        return apt;
++    return madeira_implicit_mta();
+ }
+ 
+ /* The given OXID must be local to this process */
+diff --git a/dlls/d3dx9_24/d3dx9_24.spec b/dlls/d3dx9_24/d3dx9_24.spec
+index 1c15a45..841ac27 100644
+--- a/dlls/d3dx9_24/d3dx9_24.spec
++++ b/dlls/d3dx9_24/d3dx9_24.spec
+@@ -110,8 +110,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_25/d3dx9_25.spec b/dlls/d3dx9_25/d3dx9_25.spec
+index 6fa19bf..7c363cb 100644
+--- a/dlls/d3dx9_25/d3dx9_25.spec
++++ b/dlls/d3dx9_25/d3dx9_25.spec
+@@ -110,8 +110,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_26/d3dx9_26.spec b/dlls/d3dx9_26/d3dx9_26.spec
+index 3c1eadb..0e55241 100644
+--- a/dlls/d3dx9_26/d3dx9_26.spec
++++ b/dlls/d3dx9_26/d3dx9_26.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_27/d3dx9_27.spec b/dlls/d3dx9_27/d3dx9_27.spec
+index 3c1eadb..0e55241 100644
+--- a/dlls/d3dx9_27/d3dx9_27.spec
++++ b/dlls/d3dx9_27/d3dx9_27.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_28/d3dx9_28.spec b/dlls/d3dx9_28/d3dx9_28.spec
+index 48c143b..a26bf08 100644
+--- a/dlls/d3dx9_28/d3dx9_28.spec
++++ b/dlls/d3dx9_28/d3dx9_28.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_29/d3dx9_29.spec b/dlls/d3dx9_29/d3dx9_29.spec
+index 48c143b..a26bf08 100644
+--- a/dlls/d3dx9_29/d3dx9_29.spec
++++ b/dlls/d3dx9_29/d3dx9_29.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_30/d3dx9_30.spec b/dlls/d3dx9_30/d3dx9_30.spec
+index 48c143b..a26bf08 100644
+--- a/dlls/d3dx9_30/d3dx9_30.spec
++++ b/dlls/d3dx9_30/d3dx9_30.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_31/d3dx9_31.spec b/dlls/d3dx9_31/d3dx9_31.spec
+index 6bc1471..ca24aaf 100644
+--- a/dlls/d3dx9_31/d3dx9_31.spec
++++ b/dlls/d3dx9_31/d3dx9_31.spec
+@@ -113,8 +113,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_32/d3dx9_32.spec b/dlls/d3dx9_32/d3dx9_32.spec
+index 04abf61..91a740d 100644
+--- a/dlls/d3dx9_32/d3dx9_32.spec
++++ b/dlls/d3dx9_32/d3dx9_32.spec
+@@ -113,8 +113,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_33/d3dx9_33.spec b/dlls/d3dx9_33/d3dx9_33.spec
+index 04abf61..91a740d 100644
+--- a/dlls/d3dx9_33/d3dx9_33.spec
++++ b/dlls/d3dx9_33/d3dx9_33.spec
+@@ -113,8 +113,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_34/d3dx9_34.spec b/dlls/d3dx9_34/d3dx9_34.spec
+index 04abf61..91a740d 100644
+--- a/dlls/d3dx9_34/d3dx9_34.spec
++++ b/dlls/d3dx9_34/d3dx9_34.spec
+@@ -113,8 +113,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_35/d3dx9_35.spec b/dlls/d3dx9_35/d3dx9_35.spec
+index 04abf61..91a740d 100644
+--- a/dlls/d3dx9_35/d3dx9_35.spec
++++ b/dlls/d3dx9_35/d3dx9_35.spec
+@@ -113,8 +113,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_36/d3dx9_36.spec b/dlls/d3dx9_36/d3dx9_36.spec
+index e430426..f7e2b45 100644
+--- a/dlls/d3dx9_36/d3dx9_36.spec
++++ b/dlls/d3dx9_36/d3dx9_36.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_36/texture.c b/dlls/d3dx9_36/texture.c
+index 799ff1e..506054a 100644
+--- a/dlls/d3dx9_36/texture.c
++++ b/dlls/d3dx9_36/texture.c
+@@ -2089,3 +2089,50 @@ HRESULT WINAPI D3DXComputeNormalMap(IDirect3DTexture9 *texture, IDirect3DTexture
+ 
+     return D3D_OK;
+ }
++
++/* madeira-bcd: D3DXCreateVolumeTextureFromResourceEx (tools/patch-wine-d3dx9-volume-resource.py):
++ * the resource is loaded and handed to D3DXCreateVolumeTextureFromFileInMemoryEx, as
++ * D3DXCreateTextureFromResourceExW does for 2D textures (GTA IV called it; Wine had a stub). */
++HRESULT WINAPI D3DXCreateVolumeTextureFromResourceExW(struct IDirect3DDevice9 *device, HMODULE srcmodule,
++        const WCHAR *resource, UINT width, UINT height, UINT depth, UINT miplevels, DWORD usage,
++        D3DFORMAT format, D3DPOOL pool, DWORD filter, DWORD mipfilter, D3DCOLOR colorkey,
++        D3DXIMAGE_INFO *srcinfo, PALETTEENTRY *palette, struct IDirect3DVolumeTexture9 **volume_texture)
++{
++    HRSRC resinfo;
++    void *buffer;
++    DWORD size;
++
++    TRACE("device %p, srcmodule %p, resource %s, volume_texture %p.\n", device, srcmodule,
++            debugstr_w(resource), volume_texture);
++
++    if (!device || !volume_texture)
++        return D3DERR_INVALIDCALL;
++    if (!(resinfo = FindResourceW(srcmodule, resource, (const WCHAR *)RT_RCDATA)))
++        return D3DXERR_INVALIDDATA;
++    if (FAILED(load_resource_into_memory(srcmodule, resinfo, &buffer, &size)))
++        return D3DXERR_INVALIDDATA;
++    return D3DXCreateVolumeTextureFromFileInMemoryEx(device, buffer, size, width, height, depth, miplevels,
++            usage, format, pool, filter, mipfilter, colorkey, srcinfo, palette, volume_texture);
++}
++
++HRESULT WINAPI D3DXCreateVolumeTextureFromResourceExA(struct IDirect3DDevice9 *device, HMODULE srcmodule,
++        const char *resource, UINT width, UINT height, UINT depth, UINT miplevels, DWORD usage,
++        D3DFORMAT format, D3DPOOL pool, DWORD filter, DWORD mipfilter, D3DCOLOR colorkey,
++        D3DXIMAGE_INFO *srcinfo, PALETTEENTRY *palette, struct IDirect3DVolumeTexture9 **volume_texture)
++{
++    HRSRC resinfo;
++    void *buffer;
++    DWORD size;
++
++    TRACE("device %p, srcmodule %p, resource %s, volume_texture %p.\n", device, srcmodule,
++            debugstr_a(resource), volume_texture);
++
++    if (!device || !volume_texture)
++        return D3DERR_INVALIDCALL;
++    if (!(resinfo = FindResourceA(srcmodule, resource, (const char *)RT_RCDATA)))
++        return D3DXERR_INVALIDDATA;
++    if (FAILED(load_resource_into_memory(srcmodule, resinfo, &buffer, &size)))
++        return D3DXERR_INVALIDDATA;
++    return D3DXCreateVolumeTextureFromFileInMemoryEx(device, buffer, size, width, height, depth, miplevels,
++            usage, format, pool, filter, mipfilter, colorkey, srcinfo, palette, volume_texture);
++}
+diff --git a/dlls/d3dx9_37/d3dx9_37.spec b/dlls/d3dx9_37/d3dx9_37.spec
+index e430426..f7e2b45 100644
+--- a/dlls/d3dx9_37/d3dx9_37.spec
++++ b/dlls/d3dx9_37/d3dx9_37.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_38/d3dx9_38.spec b/dlls/d3dx9_38/d3dx9_38.spec
+index e430426..f7e2b45 100644
+--- a/dlls/d3dx9_38/d3dx9_38.spec
++++ b/dlls/d3dx9_38/d3dx9_38.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_39/d3dx9_39.spec b/dlls/d3dx9_39/d3dx9_39.spec
+index e430426..f7e2b45 100644
+--- a/dlls/d3dx9_39/d3dx9_39.spec
++++ b/dlls/d3dx9_39/d3dx9_39.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_40/d3dx9_40.spec b/dlls/d3dx9_40/d3dx9_40.spec
+index e430426..f7e2b45 100644
+--- a/dlls/d3dx9_40/d3dx9_40.spec
++++ b/dlls/d3dx9_40/d3dx9_40.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_41/d3dx9_41.spec b/dlls/d3dx9_41/d3dx9_41.spec
+index e430426..f7e2b45 100644
+--- a/dlls/d3dx9_41/d3dx9_41.spec
++++ b/dlls/d3dx9_41/d3dx9_41.spec
+@@ -114,8 +114,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_42/d3dx9_42.spec b/dlls/d3dx9_42/d3dx9_42.spec
+index b857564..711cf65 100644
+--- a/dlls/d3dx9_42/d3dx9_42.spec
++++ b/dlls/d3dx9_42/d3dx9_42.spec
+@@ -112,8 +112,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/d3dx9_43/d3dx9_43.spec b/dlls/d3dx9_43/d3dx9_43.spec
+index b857564..711cf65 100644
+--- a/dlls/d3dx9_43/d3dx9_43.spec
++++ b/dlls/d3dx9_43/d3dx9_43.spec
+@@ -112,8 +112,8 @@
+ @ stdcall D3DXCreateVolumeTextureFromFileInMemoryEx(ptr ptr long long long long long long long long long long long ptr ptr ptr)
+ @ stdcall D3DXCreateVolumeTextureFromFileW(ptr wstr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceA(ptr long ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExA(ptr long ptr long long long long long long long long long long ptr ptr ptr)
+-@ stub D3DXCreateVolumeTextureFromResourceExW(ptr long ptr long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExA(ptr ptr str long long long long long long long long long long ptr ptr ptr)
++@ stdcall D3DXCreateVolumeTextureFromResourceExW(ptr ptr wstr long long long long long long long long long long ptr ptr ptr)
+ @ stub D3DXCreateVolumeTextureFromResourceW(ptr long ptr ptr)
+ @ stdcall D3DXDebugMute(long)
+ @ stdcall D3DXDeclaratorFromFVF(long ptr)
+diff --git a/dlls/dinput/ansi.c b/dlls/dinput/ansi.c
+index a9e948c..5711b67 100644
+--- a/dlls/dinput/ansi.c
++++ b/dlls/dinput/ansi.c
+@@ -312,7 +312,7 @@ static BOOL CALLBACK enum_objects_wtoa_callback( const DIDEVICEOBJECTINSTANCEW *
+     DIDEVICEOBJECTINSTANCEA instance_a = {sizeof(instance_a)};
+ 
+     dideviceobjectinstance_wtoa( instance_w, &instance_a );
+-    return params->callback( &instance_a, params->ref );
++    return enum_callback_wrapper( params->callback, &instance_a, params->ref );   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ }
+ 
+ static HRESULT WINAPI dinput_device_a_EnumObjects( IDirectInputDevice8A *iface_a, LPDIENUMDEVICEOBJECTSCALLBACKA callback,
+@@ -479,7 +479,7 @@ static BOOL CALLBACK enum_effects_wtoa_callback( const DIEFFECTINFOW *info_w, vo
+     DIEFFECTINFOA info_a = {sizeof(info_a)};
+ 
+     dieffectinfo_wtoa( info_w, &info_a );
+-    return params->callback( &info_a, params->ref );
++    return enum_callback_wrapper( params->callback, &info_a, params->ref );   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ }
+ 
+ static HRESULT WINAPI dinput_device_a_EnumEffects( IDirectInputDevice8A *iface_a, LPDIENUMEFFECTSCALLBACKA callback,
+@@ -774,7 +774,7 @@ static BOOL CALLBACK enum_devices_wtoa_callback( const DIDEVICEINSTANCEW *instan
+     DIDEVICEINSTANCEA instance_a = {sizeof(instance_a)};
+ 
+     dideviceinstance_wtoa( instance_w, &instance_a );
+-    return params->callback( &instance_a, params->ref );
++    return enum_callback_wrapper( params->callback, &instance_a, params->ref );   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ }
+ 
+ static HRESULT WINAPI dinput8_a_EnumDevices( IDirectInput8A *iface_a, DWORD type, LPDIENUMDEVICESCALLBACKA callback,
+@@ -846,7 +846,7 @@ static BOOL CALLBACK enum_devices_by_semantics_wtoa_callback( const DIDEVICEINST
+     DIDEVICEINSTANCEA instance_a = {sizeof(instance_a)};
+ 
+     dideviceinstance_wtoa( instance_w, &instance_a );
+-    return params->callback( &instance_a, iface_a, flags, remaining, params->ref );
++    return enum_callback_wrapper5( params->callback, &instance_a, iface_a, flags, remaining, params->ref );   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ }
+ 
+ static HRESULT WINAPI dinput8_a_EnumDevicesBySemantics( IDirectInput8A *iface_a, const char *username_a, DIACTIONFORMATA *format_a,
+diff --git a/dlls/dinput/device.c b/dlls/dinput/device.c
+index 35518dd..e4283bf 100644
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -739,7 +739,7 @@ static BOOL enum_objects_callback( struct dinput_device *impl, UINT index, struc
+         return DIENUM_CONTINUE;
+ 
+     /* Applications may return non-zero values instead of DIENUM_CONTINUE. */
+-    return params->callback( instance, params->context ) ? DIENUM_CONTINUE : DIENUM_STOP;
++    return enum_callback_wrapper( params->callback, instance, params->context ) ? DIENUM_CONTINUE : DIENUM_STOP;   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ }
+ 
+ static HRESULT WINAPI dinput_device_EnumObjects( IDirectInputDevice8W *iface, LPDIENUMDEVICEOBJECTSCALLBACKW callback,
+@@ -1621,56 +1621,56 @@ static HRESULT WINAPI dinput_device_EnumEffects( IDirectInputDevice8W *iface, LP
+     {
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_ConstantForce );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+     }
+ 
+     if (type == DIEFT_ALL || type == DIEFT_RAMPFORCE)
+     {
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_RampForce );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+     }
+ 
+     if (type == DIEFT_ALL || type == DIEFT_PERIODIC)
+     {
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Square );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Sine );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Triangle );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_SawtoothUp );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_SawtoothDown );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+     }
+ 
+     if (type == DIEFT_ALL || type == DIEFT_CONDITION)
+     {
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Spring );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Damper );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Inertia );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+ 
+         hr = IDirectInputDevice8_GetEffectInfo( iface, &info, &GUID_Friction );
+         if (FAILED(hr) && hr != DIERR_DEVICENOTREG) return hr;
+-        if (hr == DI_OK && callback( &info, context ) == DIENUM_STOP) return DI_OK;
++        if (hr == DI_OK && enum_callback_wrapper( callback, &info, context ) == DIENUM_STOP) return DI_OK;
+     }
+ 
+     return DI_OK;
+diff --git a/dlls/dinput/dinput.c b/dlls/dinput/dinput.c
+index 7966eba..9a74f83 100644
+--- a/dlls/dinput/dinput.c
++++ b/dlls/dinput/dinput.c
+@@ -78,6 +78,43 @@ __ASM_GLOBAL_FUNC( enum_callback_wrapper,
+ #define enum_callback_wrapper(callback, instance, ref) (callback)((instance), (ref))
+ #endif
+ 
++/* madeira-bcd: dinput-cdecl-callbacks-v1: the five-argument twin of enum_callback_wrapper, for EnumDevicesBySemantics' callback */
++#if defined __i386__ && defined _MSC_VER
++__declspec(naked) BOOL enum_callback_wrapper5(void *callback, const void *a, const void *b, DWORD c, DWORD d, void *ref)
++{
++    __asm
++    {
++        push ebp
++        mov ebp, esp
++        push [ebp+28]
++        push [ebp+24]
++        push [ebp+20]
++        push [ebp+16]
++        push [ebp+12]
++        call [ebp+8]
++        leave
++        ret
++    }
++}
++#elif defined __i386__ && defined __GNUC__
++__ASM_GLOBAL_FUNC( enum_callback_wrapper5,
++    "pushl %ebp\n\t"
++    __ASM_CFI(".cfi_adjust_cfa_offset 4\n\t")
++    __ASM_CFI(".cfi_rel_offset %ebp,0\n\t")
++    "movl %esp,%ebp\n\t"
++    __ASM_CFI(".cfi_def_cfa_register %ebp\n\t")
++    "pushl 28(%ebp)\n\t"
++    "pushl 24(%ebp)\n\t"
++    "pushl 20(%ebp)\n\t"
++    "pushl 16(%ebp)\n\t"
++    "pushl 12(%ebp)\n\t"
++    "call *8(%ebp)\n\t"
++    "leave\n\t"
++    __ASM_CFI(".cfi_def_cfa %esp,4\n\t")
++    __ASM_CFI(".cfi_same_value %ebp\n\t")
++    "ret" )
++#endif
++
+ static HRESULT WINAPI dinput7_EnumDevices( IDirectInput7W *iface, DWORD type, LPDIENUMDEVICESCALLBACKW callback,
+                                            void *context, DWORD flags )
+ {
+@@ -578,7 +615,7 @@ static HRESULT WINAPI dinput8_EnumDevicesBySemantics( IDirectInput8W *iface, con
+         else if (FAILED(hr = IDirectInputDevice8_EnumObjects( device, enum_device_object_semantics, &object_params, DIDFT_ALL )))
+             WARN( "Failed to enumerate device %p objects, hr %#lx\n", device, hr );
+         else
+-            ret = callback( &object_params.instance, device, object_params.flags, params.device_count, context );
++            ret = enum_callback_wrapper5( callback, &object_params.instance, device, object_params.flags, params.device_count, context );   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ 
+         IDirectInputDevice8_Release( device );
+         if (ret == DIENUM_STOP) goto cleanup;
+diff --git a/dlls/dinput/dinput_private.h b/dlls/dinput/dinput_private.h
+index c39df7b..cba92d6 100644
+--- a/dlls/dinput/dinput_private.h
++++ b/dlls/dinput/dinput_private.h
+@@ -27,6 +27,16 @@
+ #include "dinputd.h"
+ #include "wine/list.h"
+ 
++/* madeira-bcd: dinput-cdecl-callbacks-v1 (tools/patch-wine-dinput-cdecl-callbacks.py, round 669): a program's callback is called through a
++ * frame, so a cdecl callback cannot unbalance the stack (enum_callback_wrapper is defined in dinput.c). */
++#if defined __i386__ && (defined __GNUC__ || defined _MSC_VER)
++extern BOOL enum_callback_wrapper( void *callback, const void *instance, void *ref );
++extern BOOL enum_callback_wrapper5( void *callback, const void *a, const void *b, DWORD c, DWORD d, void *ref );
++#else
++#define enum_callback_wrapper(callback, instance, ref) (callback)((instance), (ref))
++#define enum_callback_wrapper5(callback, a, b, c, d, ref) (callback)((a), (b), (c), (d), (ref))
++#endif
++
+ extern HINSTANCE DINPUT_instance;
+ 
+ struct dinput
+diff --git a/dlls/dinput/joystick_hid.c b/dlls/dinput/joystick_hid.c
+index 22709c4..c288800 100644
+--- a/dlls/dinput/joystick_hid.c
++++ b/dlls/dinput/joystick_hid.c
+@@ -1115,7 +1115,7 @@ static HRESULT hid_joystick_enum_created_effect_objects( IDirectInputDevice8W *i
+     TRACE( "iface %p, callback %p, context %p, flags %#lx.\n", iface, callback, context, flags );
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(effect, next, &impl->effect_list, struct hid_joystick_effect, entry)
+-        if (callback( &effect->IDirectInputEffect_iface, context ) != DIENUM_CONTINUE) break;
++        if (enum_callback_wrapper( callback, &effect->IDirectInputEffect_iface, context ) != DIENUM_CONTINUE) break;   /* madeira-bcd: dinput-cdecl-callbacks-v1 */
+ 
+     return DI_OK;
+ }
+diff --git a/dlls/msvcrt/time.c b/dlls/msvcrt/time.c
+index b52bb87..5eb06e0 100644
+--- a/dlls/msvcrt/time.c
++++ b/dlls/msvcrt/time.c
+@@ -780,11 +780,20 @@ int CDECL _ftime32_s(struct __timeb32 *buf)
+ __time64_t CDECL _time64(__time64_t *buf)
+ {
+     __time64_t curtime;
+-    struct __timeb64 tb;
++    FILETIME ft;
++    ULONGLONG time;
+ 
+-    _ftime64(&tb);
++    /* BCD (from Wine 0497d0ff62f, "msvcrt: Avoid expensive timezone queries from plain
++     * time() calls", by Benjamin Fischer): the seconds come straight from the system
++     * time, the same arithmetic _ftime64 does, without its GetTimeZoneInformation call,
++     * whose answer time() never returned. _ftime64's one lasting effect, the first-use
++     * _tzset, is kept here, so a program that reads _timezone or _daylight after a
++     * time() call finds them set as before (Wine's commit drops that as well). */
++    _tzset_init();
+ 
+-    curtime = tb.time;
++    GetSystemTimeAsFileTime(&ft);
++    time = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
++    curtime = time / TICKSPERSEC - SECS_1601_TO_1970;
+     return buf ? *buf = curtime : curtime;
+ }
+ 
+@@ -794,11 +803,10 @@ __time64_t CDECL _time64(__time64_t *buf)
+ __time32_t CDECL _time32(__time32_t *buf)
+ {
+     __time32_t curtime;
+-    struct __timeb64 tb;
+-
+-    _ftime64(&tb);
++    __time64_t time;
+ 
+-    curtime = (tb.time == (__time32_t)tb.time) ? tb.time : -1;
++    time = _time64(NULL);
++    curtime = (time == (__time32_t)time) ? time : -1;
+     return buf ? *buf = curtime : curtime;
+ }
+ 
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index b6e0c06..975e5e4 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -1276,6 +1276,16 @@ NTSTATUS WINAPI RtlSleepConditionVariableSRW( RTL_CONDITION_VARIABLE *variable,
+  * thread waiting in RtlWaitOnAddress() via NtAlertThreadByThreadId.
+  */
+ 
++/* madeira-bcd woa-wake-order (tools/patch-wine-woa-wake-order.py; Wine commit 81e52628b25 by Paul Gofman): a waker takes
++ * a waiter's entry out of the queue BEFORE it clears entry->addr, and reads the thread to alert first. A waiter looks at
++ * entry.addr without the queue's lock when its park returns (an alert left over from an earlier wake, a time-out); once it
++ * reads NULL it returns and its stack entry is gone. Clearing first let it go while the waker still had to unlink the entry
++ * and read its tid from that stack. For the i386 ntdll only (the 32-bit programs' copy, which the build compiles from this
++ * tree); every other build compiles the lines as they were. */
++#ifdef __i386__
++#define MADEIRA_WOA_WAKE_ORDER 1
++#endif
++
+ struct futex_entry
+ {
+     struct list entry;
+@@ -1375,6 +1385,41 @@ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
+     return FALSE;
+ }
+ 
++#ifdef __i386__
++/* madeira-bcd woa-recheck (tools/patch-wine-woa-recheck.py): an infinite wait on an address waits in one-second slices
++ * (MADEIRA_WOA_SLICE, which the unix side recognises: unless env.MADEIRA_WOA_RECHECK is 1 it waits the infinite wait the
++ * slice stands for). After each slice the waiter looks at its own entry under the queue's spinlock: removed by a waker
++ * whose alert never came ends the wait with STATUS_SUCCESS (a spurious wake-up, which every caller handles); otherwise it
++ * waits again. */
++#define MADEIRA_WOA_SLICE (-10000001)
++static NTSTATUS madeira_woa_wait( struct futex_queue *queue, struct futex_entry *entry, const void *addr, SIZE_T size )
++{
++    static LONG logged;
++    LARGE_INTEGER slice;
++    unsigned int seconds = 0;
++    BOOL dequeued;
++    NTSTATUS ret;
++
++    slice.QuadPart = MADEIRA_WOA_SLICE;
++    for (;;)
++    {
++        ret = NtWaitForAlertByThreadId( addr, &slice );
++        if (ret != STATUS_TIMEOUT) return ret;
++        seconds++;
++        spin_lock( &queue->lock );
++        dequeued = !entry->addr;
++        spin_unlock( &queue->lock );
++        if (dequeued)
++        {
++            if (InterlockedIncrement( &logged ) <= 32)
++                ERR( "[woa-rescue] tid=%04lx addr=%p size=%Iu after %u s: dequeued, no alert within the slice\n",
++                     (unsigned long)GetCurrentThreadId(), addr, size, seconds );
++            return STATUS_SUCCESS;
++        }
++    }
++}
++#endif
++
+ /***********************************************************************
+  *           RtlWaitOnAddress   (NTDLL.@)
+  */
+@@ -1428,6 +1473,10 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     /* ml441: pass the real address — the unix layer ignores it functionally
+      * but the [waiters] registry (ml440) records it, so long parks are now
+      * attributable to a named lock word. */
++#ifdef __i386__
++    if (!timeout) ret = madeira_woa_wait( queue, &entry, addr, size );   /* madeira-bcd woa-recheck */
++    else
++#endif
+     ret = NtWaitForAlertByThreadId( addr, timeout );
+ 
+     if (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
+@@ -1439,7 +1488,11 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     }
+ 
+     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
++#ifdef MADEIRA_WOA_WAKE_ORDER
++    if (ReadPointerAcquire( (void * volatile *)&entry.addr ))
++#else
+     if (entry.addr)
++#endif
+     {
+         spin_lock( &queue->lock );
+         if (entry.addr)
+@@ -1478,6 +1531,17 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+     {
+         if (entry->addr == addr)
+         {
++#ifdef MADEIRA_WOA_WAKE_ORDER
++            DWORD tid = entry->tid;
++            list_remove( &entry->entry );
++            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
++            if (count == ARRAY_SIZE(tids))
++            {
++                NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
++                count = 0;
++            }
++            tids[count++] = (HANDLE)(ULONG_PTR)tid;
++#else
+             entry->addr = NULL;
+             list_remove( &entry->entry );
+             if (count == ARRAY_SIZE(tids))
+@@ -1486,6 +1550,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+                 count = 0;
+             }
+             tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
++#endif
+         }
+     }
+ 
+@@ -1528,8 +1593,13 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+             /* Remove this entry from the queue, so that a simultaneous call to
+              * RtlWakeAddressSingle() will not also wake it—two simultaneous
+              * calls must wake at least two waiters if they exist. */
++#ifdef MADEIRA_WOA_WAKE_ORDER
++            list_remove( &entry->entry );
++            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
++#else
+             entry->addr = NULL;
+             list_remove( &entry->entry );
++#endif
+             break;
+         }
+     }
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 856b75a..96b04d9 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -556,6 +556,70 @@ static int xattr_fget( int filedes, const char *name, void *value, size_t size )
+ #endif
+ }
+ 
++#ifdef WINE_IOS
++/* madeira-bcd: madeira_xattr_pair (tools/patch-wine-file-xattr-one-list.py, engine review 2026-11-18). get_file_info and fd_get_file_info read
++ * two extended attributes of one file, the reparse tag and then the DOS attributes, and each read listed the file's attribute names
++ * first (xattr_exists): two lists of the same file for every directory entry and every attribute query. One list answers both.
++ * has[n] is what xattr_exists would have returned for name n (listed; or the list did not fit, ERANGE: ask for the value as before),
++ * err[n] the errno it would have left. MADEIRA_XATTR_ONE_LIST=0 lists once per name again. */
++struct madeira_xattr_pair { int valid, has[2], err[2]; };
++
++static int madeira_xattr_one_list(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "MADEIRA_XATTR_ONE_LIST" );
++        on = !(e && e[0] == '0' && !e[1]);
++    }
++    return on;
++}
++
++static void madeira_xattr_pair_list( const char *path, int filedes, const char *name0, const char *name1,
++                                     struct madeira_xattr_pair *pair )
++{
++    char xattrs[1024];
++    ssize_t i = 0, ret;
++
++    pair->valid = 0;
++    if (!madeira_xattr_one_list()) return;
++    if (path)
++        ret = listxattr( path, xattrs, sizeof(xattrs), 0 );
++    else
++        ret = flistxattr( filedes, xattrs, sizeof(xattrs), 0 );
++    pair->valid = 1;
++    if (ret == -1)
++    {
++        pair->has[0] = pair->has[1] = errno == ERANGE;
++        pair->err[0] = pair->err[1] = errno;
++        return;
++    }
++    pair->has[0] = pair->has[1] = 0;
++    pair->err[0] = pair->err[1] = ENOATTR;
++    while (i < ret)
++    {
++        if (!strcmp( name0, &xattrs[i] )) pair->has[0] = 1;
++        if (!strcmp( name1, &xattrs[i] )) pair->has[1] = 1;
++        i += strlen(&xattrs[i]) + 1;
++    }
++}
++
++/* xattr_get (path) or xattr_fget (no path) for name number n of a listed pair */
++static int madeira_xattr_pair_get( const char *path, int filedes, const struct madeira_xattr_pair *pair, int n,
++                                   const char *name, void *value, size_t size )
++{
++    if (!pair->valid)
++        return path ? xattr_get( path, name, value, size ) : xattr_fget( filedes, name, value, size );
++    if (!pair->has[n])
++    {
++        errno = pair->err[n];
++        return -1;
++    }
++    return path ? getxattr( path, name, value, size, 0, 0 ) : fgetxattr( filedes, name, value, size, 0, 0 );
++}
++#endif
++
+ 
+ /* get space from the current directory data buffer, allocating a new one if necessary */
+ static void *get_dir_data_space( struct dir_data *data, unsigned int size )
+@@ -2223,14 +2287,24 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
+         }
+     }
+ 
++#ifdef WINE_IOS
++    struct madeira_xattr_pair madeira_xp;
++    madeira_xattr_pair_list( NULL, fd, XATTR_REPARSE, SAMBA_XATTR_DOS_ATTRIB, &madeira_xp );
++    attr_len = madeira_xattr_pair_get( NULL, fd, &madeira_xp, 0, XATTR_REPARSE, buffer, sizeof(buffer) );
++#else
+     attr_len = xattr_fget( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
++#endif
+     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
+     {
+         *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+         if (reparse_tag) memcpy( reparse_tag, buffer, sizeof(ULONG) );
+     }
+ 
++#ifdef WINE_IOS
++    attr_len = madeira_xattr_pair_get( NULL, fd, &madeira_xp, 1, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
++#else
+     attr_len = xattr_fget( fd, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
++#endif
+     if (attr_len != -1)
+         *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
+     else
+@@ -2340,14 +2414,24 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG
+     }
+     *attr |= get_file_attributes( st );
+ 
++#ifdef WINE_IOS
++    struct madeira_xattr_pair madeira_xp;
++    madeira_xattr_pair_list( path, -1, XATTR_REPARSE, SAMBA_XATTR_DOS_ATTRIB, &madeira_xp );
++    attr_len = madeira_xattr_pair_get( path, -1, &madeira_xp, 0, XATTR_REPARSE, buffer, sizeof(buffer) );
++#else
+     attr_len = xattr_get( path, XATTR_REPARSE, buffer, sizeof(buffer) );
++#endif
+     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
+     {
+         *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+         if (reparse_tag) memcpy( reparse_tag, buffer, sizeof(ULONG) );
+     }
+ 
++#ifdef WINE_IOS
++    attr_len = madeira_xattr_pair_get( path, -1, &madeira_xp, 1, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
++#else
+     attr_len = xattr_get( path, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
++#endif
+     if (attr_len != -1)
+         *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
+     else
+@@ -2717,6 +2801,13 @@ static LONGLONG get_free_bytes_for_important_data(int fd)
+     if (!(url = CFURLCreateFromFileSystemRepresentation( NULL, (UInt8 *)path, strlen(path), false ))) goto done;
+     if (!CFURLCopyResourcePropertyForKey( url, kCFURLVolumeAvailableCapacityForImportantUsageKey, &num, NULL )) goto done;
+     CFNumberGetValue( num, kCFNumberLongLongType, &space );
++    if (space == 0)
++    {
++        /* It's unlikely that a writeable disk has exactly 0 free bytes. This
++         * probably means the disk is read-only, or is not APFS. Fall back to
++         * statfs. */
++        space = -1;
++    }
+ 
+ done:
+     free( path );
+@@ -3949,16 +4040,43 @@ failed:
+ static inline int get_dos_prefix_len( const UNICODE_STRING *name )
+ {
+     static const WCHAR dosdev_prefixW[] = {'\\','D','o','s','D','e','v','i','c','e','s','\\'};
++#ifdef WINE_IOS
++    /* madeira-bcd: GLOBALROOT DOS paths (tools/patch-wine-globalroot.py), modified 2026-10-24. */
++    static const WCHAR globalrootW[] = {'G','L','O','B','A','L','R','O','O','T','\\'};
++    unsigned int first = 0;
++#endif
++    const WCHAR *buffer = name->Buffer;
++    unsigned int len = name->Length / sizeof(WCHAR), pos = 0, prefix_len;
+ 
+-    if (name->Length >= sizeof(nt_prefixW) &&
+-        !memcmp( name->Buffer, nt_prefixW, sizeof(nt_prefixW) ))
+-        return ARRAY_SIZE( nt_prefixW );
+-
+-    if (name->Length >= sizeof(dosdev_prefixW) &&
+-        !wcsnicmp( name->Buffer, dosdev_prefixW, ARRAY_SIZE( dosdev_prefixW )))
+-        return ARRAY_SIZE( dosdev_prefixW );
++    for (;;)
++    {
++        if (len >= ARRAY_SIZE(nt_prefixW) && !memcmp( buffer, nt_prefixW, sizeof(nt_prefixW) ))
++            prefix_len = ARRAY_SIZE(nt_prefixW);
++        else if (len >= ARRAY_SIZE(dosdev_prefixW) &&
++                 !wcsnicmp( buffer, dosdev_prefixW, ARRAY_SIZE(dosdev_prefixW) ))
++            prefix_len = ARRAY_SIZE(dosdev_prefixW);
++        else
++#ifdef WINE_IOS
++            return pos ? first : 0;  /* no DOS path behind the wrapper: the answer the old code gave */
++#else
++            return 0;
++#endif
+ 
+-    return 0;
++#ifdef WINE_IOS
++        if (len >= prefix_len + ARRAY_SIZE(globalrootW) &&
++            !wcsnicmp( buffer + prefix_len, globalrootW, ARRAY_SIZE(globalrootW) ))
++        {
++            if (!pos) first = prefix_len;  /* the old answer for this name */
++            /* Keep the backslash: GLOBALROOT targets the object manager root. */
++            prefix_len += ARRAY_SIZE(globalrootW) - 1;
++            buffer += prefix_len;
++            len -= prefix_len;
++            pos += prefix_len;
++            continue;
++        }
++#endif
++        return pos + prefix_len;
++    }
+ }
+ 
+ 
+@@ -6214,8 +6332,12 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             }
+             SERVER_END_REQ;
+             /* madeira-pipe-state-fd-backed: a unix pipe wrapped as a file object is a pipe by device
+-             * type but not a named-pipe object; the mode asked for is what it already is. */
+-            if (status == STATUS_INVALID_HANDLE || status == STATUS_OBJECT_TYPE_MISMATCH)
++             * type but not a named-pipe object; the mode asked for is what it already is.
++             * BCD: only when it is: byte reads and blocking (both fields 0, what libuv's uv_pipe_open
++             * asks for). Message reads or the non-blocking mode are not what a unix pipe does, and
++             * keep the server's failure. */
++            if ((status == STATUS_INVALID_HANDLE || status == STATUS_OBJECT_TYPE_MISMATCH) &&
++                !info->CompletionMode && !info->ReadMode)
+             {
+                 FILE_FS_DEVICE_INFORMATION device;
+                 IO_STATUS_BLOCK device_io;
+diff --git a/dlls/ntdll/unix/security.c b/dlls/ntdll/unix/security.c
+index f18f967..95d91b2 100644
+--- a/dlls/ntdll/unix/security.c
++++ b/dlls/ntdll/unix/security.c
+@@ -366,7 +366,7 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
+         0,    /* TokenRestrictedDeviceGroups */
+         0,    /* TokenSecurityAttributes */
+         0,    /* TokenIsRestricted */
+-        0     /* TokenProcessTrustLevel */
++        0,    /* TokenProcessTrustLevel */
+     };
+ 
+     ULONG len = 0;
+@@ -374,7 +374,7 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
+ 
+     TRACE( "(%p,%s,%p,%d,%p)\n", token, debugstr_TokenInformationClass(class), info, length, retlen );
+ 
+-    if (class < MaxTokenInfoClass) len = info_len[class];
++    if (class < ARRAY_SIZE(info_len)) len = info_len[class];
+     if (retlen) *retlen = len;
+     if (length < len) return STATUS_BUFFER_TOO_SMALL;
+ 
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index bf6a9f9..cf9ebf1 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -2083,24 +2083,26 @@ static NTSTATUS do_getsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
+     int fd, needs_close = FALSE;
+     socklen_t len = out_size;
+     NTSTATUS status;
+-    int ret;
+-    /* The kernel fills a local copy and the caller's buffer is written by an ordinary store. On iOS, Madeira maps
+-     * anonymous RWX memory as an RX view with a separate RW alias (W^X): the kernel cannot write such a buffer
+-     * (EFAULT, so WSAEFAULT where Windows succeeds), while a store into it is redirected to the alias. */
+-    char local[256], *tmp = out_size <= sizeof(local) ? local : malloc( out_size );
++    int ret, err, copy = 0;
++    char local[256];
+ 
+-    if (!tmp) return STATUS_NO_MEMORY;
+     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+-    {
+-        if (tmp != local) free( tmp );
+         return status;
+-    }
+ 
+-    ret = getsockopt( fd, level, option, tmp, &len );
++    ret = getsockopt( fd, level, option, out_buffer, &len );
++    /* On iOS, Madeira maps anonymous RWX memory as an RX view with a separate RW alias (W^X): the kernel cannot write
++     * such a buffer (EFAULT, so WSAEFAULT where Windows succeeds), while a store into it is redirected to the alias.
++     * BCD: the local copy is taken only then, where the call failed before; every other call is the direct one above,
++     * as it always was (the copy is bounded, so a caller's length is never allocated). */
++    if (ret && errno == EFAULT)
++    {
++        len = min( out_size, sizeof(local) );
++        if (!(ret = getsockopt( fd, level, option, local, &len ))) copy = 1;
++    }
++    err = errno;
+     if (needs_close) close( fd );
+-    if (!ret) memcpy( out_buffer, tmp, min( len, out_size ) );
+-    if (tmp != local) free( tmp );
+-    if (ret) return sock_errno_to_status( errno );
++    if (ret) return sock_errno_to_status( err );
++    if (copy) memcpy( out_buffer, local, len );
+     if (io)
+     {
+         io->Status = STATUS_SUCCESS;
+@@ -2678,10 +2680,12 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+                 return status;
+ 
+ #ifdef IP_DONTFRAG
+-            {   /* a local copy, see do_getsockopt */
++            ret = getsockopt( fd, IPPROTO_IP, IP_DONTFRAG, out_buffer, &len );
++            if (ret && errno == EFAULT)
++            {   /* a local copy where the kernel cannot write the buffer, see do_getsockopt */
+                 char value[sizeof(DWORD)];
+ 
+-                if (len > sizeof(value)) len = sizeof(value);
++                len = min( out_size, sizeof(value) );
+                 ret = getsockopt( fd, IPPROTO_IP, IP_DONTFRAG, value, &len );
+                 if (!ret) memcpy( out_buffer, value, len );
+             }
+@@ -2901,10 +2905,12 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+                 return status;
+ 
+ #ifdef IPV6_DONTFRAG
+-            {   /* a local copy, see do_getsockopt */
++            ret = getsockopt( fd, IPPROTO_IPV6, IPV6_DONTFRAG, out_buffer, &len );
++            if (ret && errno == EFAULT)
++            {   /* a local copy where the kernel cannot write the buffer, see do_getsockopt */
+                 char value[sizeof(DWORD)];
+ 
+-                if (len > sizeof(value)) len = sizeof(value);
++                len = min( out_size, sizeof(value) );
+                 ret = getsockopt( fd, IPPROTO_IPV6, IPV6_DONTFRAG, value, &len );
+                 if (!ret) memcpy( out_buffer, value, len );
+             }
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index cdee6eb..1264c5d 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -3625,6 +3625,19 @@ NTSTATUS WINAPI NtYieldExecution(void)
+ /******************************************************************
+  *		NtDelayExecution (NTDLL.@)
+  */
++#ifdef WINE_IOS
++/* madeira-bcd sleep-kernel-apc (tools/patch-wine-sleep-kernel-apc.py): with env.MADEIRA_SLEEP_KERNEL_APC = 1 a
++ * non-alertable sleep waits in the server with SELECT_INTERRUPTIBLE, so a system APC (an I/O completion) queued for
++ * the sleeping thread runs during the sleep, as on Windows; on iOS nothing can interrupt the host select(). Read at
++ * each sleep, so the value is the session's own. */
++static int madeira_sleep_kernel_apc(void)
++{
++    const char *e = getenv( "MADEIRA_SLEEP_KERNEL_APC" );
++
++    return e && e[0] == '1' && !e[1];
++}
++#endif
++
+ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
+     unsigned int status = STATUS_SUCCESS;
+@@ -3650,6 +3663,10 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+ 
+     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
+     {
++#ifdef WINE_IOS
++        if (madeira_sleep_kernel_apc())   /* madeira-bcd sleep-kernel-apc */
++            for (;;) server_wait( NULL, 0, SELECT_INTERRUPTIBLE, NULL );
++#endif
+         for (;;) select( 0, NULL, NULL, NULL, NULL );
+     }
+     else
+@@ -3667,6 +3684,13 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+            we only care about the result of the yield for zero timeouts */
+         status = NtYieldExecution();
+         if (!when) return status;
++#ifdef WINE_IOS
++        if (madeira_sleep_kernel_apc())   /* madeira-bcd sleep-kernel-apc: system APCs run during the sleep */
++        {
++            server_wait( NULL, 0, SELECT_INTERRUPTIBLE, timeout );
++            return STATUS_SUCCESS;
++        }
++#endif
+ 
+         for (;;)
+         {
+@@ -4921,6 +4945,7 @@ static struct
+     const void *addr;   /* wait-on-address cookie; NULL = not currently parked */
+     ULONGLONG since;    /* NtQuerySystemTime at park entry */
+     int inf;            /* 1 = INFINITE wait */
++    const void *slice;  /* madeira-bcd woa-recheck: the address whose slice just timed out (the park goes on) */
+ } ios_alert_waiters[IOS_ALERT_WAITER_MAX];
+ 
+ static int ios_alert_waiter_slot( void *tid )
+@@ -5295,6 +5320,18 @@ static LONGLONG update_timeout( ULONGLONG end )
+ /***********************************************************************
+  *             NtWaitForAlertByThreadId (NTDLL.@)
+  */
++/* madeira-bcd woa-recheck (tools/patch-wine-woa-recheck.py): the 32-bit ntdll's RtlWaitOnAddress waits an infinite
++ * wait out in slices of exactly MADEIRA_WOA_SLICE, re-checking its queue entry after each. With
++ * env.MADEIRA_WOA_RECHECK = 1 the slices of one park keep its [waiters] start time and count as infinite; otherwise a
++ * slice is waited out as the infinite wait it stands for (the old behaviour). Read at each slice. */
++#define MADEIRA_WOA_SLICE (-10000001)
++static int madeira_woa_recheck(void)
++{
++    const char *e = getenv( "MADEIRA_WOA_RECHECK" );
++
++    return e && e[0] == '1' && !e[1];
++}
++
+ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
+ {
+     IOS_ECO_POLL();   /* ml1133 */
+@@ -5334,7 +5371,13 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
+         ULONGLONG end;
+         int ret;
+         int ios_wslot;
++        int ios_woa_slice = timeout && timeout->QuadPart == MADEIRA_WOA_SLICE;   /* madeira-bcd woa-recheck */
+ 
++        if (ios_woa_slice && !madeira_woa_recheck())
++        {
++            timeout = NULL;   /* madeira-bcd woa-recheck not on: the infinite wait the slice stands for */
++            ios_woa_slice = 0;
++        }
+         if (timeout)
+         {
+             if (timeout->QuadPart == TIMEOUT_INFINITE)
+@@ -5351,8 +5394,11 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
+         {
+             LARGE_INTEGER ios_wnow;
+             NtQuerySystemTime( &ios_wnow );
+-            ios_alert_waiters[ios_wslot].since = ios_wnow.QuadPart;
+-            ios_alert_waiters[ios_wslot].inf = !timeout;
++            /* madeira-bcd woa-recheck: the next slice of the same park keeps its start and counts as infinite */
++            if (!ios_woa_slice || ios_alert_waiters[ios_wslot].slice != (address ? address : (const void *)0x1))
++                ios_alert_waiters[ios_wslot].since = ios_wnow.QuadPart;
++            ios_alert_waiters[ios_wslot].inf = !timeout || ios_woa_slice;
++            ios_alert_waiters[ios_wslot].slice = NULL;
+             ios_alert_waiters[ios_wslot].addr = address ? address : (const void *)0x1;
+         }
+ 
+@@ -5400,7 +5446,12 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
+ 
+             if (ret == -1 && errno == ETIMEDOUT)
+             {
+-                if (ios_wslot >= 0) ios_alert_waiters[ios_wslot].addr = NULL;
++                if (ios_wslot >= 0)
++                {
++                    /* madeira-bcd woa-recheck: a slice that timed out leaves its park open for the next slice */
++                    ios_alert_waiters[ios_wslot].slice = ios_woa_slice ? ios_alert_waiters[ios_wslot].addr : NULL;
++                    ios_alert_waiters[ios_wslot].addr = NULL;
++                }
+                 if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
+                     ERR( "[alert-unix] tid=%04x -> TIMEOUT\n",
+                          (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 282ef39..e142c9b 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -1597,22 +1597,31 @@ static void read_dev_urandom( void *buf, ULONG len )
+     int fd = open( "/dev/urandom", O_RDONLY );
+     if (fd != -1)
+     {
+-        /* read into a local chunk and copy it, so a buffer the kernel cannot write (anonymous RWX memory on iOS,
+-         * see do_getsockopt in socket.c) is filled instead of silently left as it was */
+         char chunk[256];
+         int ret;
+ 
+-        while (len)
++        do
+         {
+-            do
++            ret = read( fd, buf, len );
++        }
++        while (ret == -1 && errno == EINTR);
++        /* BCD: only where that read failed because the kernel cannot write the buffer (anonymous RWX memory on iOS,
++         * see do_getsockopt in socket.c): read into a local chunk and copy it, so the buffer is filled instead of
++         * silently left as it was. Every other read is the one above, as it always was. */
++        if (ret == -1 && errno == EFAULT)
++        {
++            while (len)
+             {
+-                ret = read( fd, chunk, min( len, sizeof(chunk) ) );
++                do
++                {
++                    ret = read( fd, chunk, min( len, sizeof(chunk) ) );
++                }
++                while (ret == -1 && errno == EINTR);
++                if (ret <= 0) break;
++                memcpy( buf, chunk, ret );
++                buf = (char *)buf + ret;
++                len -= ret;
+             }
+-            while (ret == -1 && errno == EINTR);
+-            if (ret <= 0) break;
+-            memcpy( buf, chunk, ret );
+-            buf = (char *)buf + ret;
+-            len -= ret;
+         }
+         close( fd );
+     }
+@@ -3048,12 +3057,6 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
+     bias = (LONG)(mktime(tm) - year_start) / 60;
+ 
+     tm = localtime(&year_start);
+-    tm1 = tm2 = *tm;
+-    tm1.tm_isdst = 0;
+-    tm2.tm_isdst = 1;
+-    inverted_dst = mktime(&tm1) < mktime(&tm2);
+-    if (inverted_dst) bias += 60;
+-
+     if (current_year == tm->tm_year && current_bias == bias)
+     {
+         *tzi = cached_tzi;
+@@ -3061,10 +3064,27 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
+         return;
+     }
+ 
+-    memset(tzi, 0, sizeof(*tzi));
+-    TRACE("tz data will be valid through year %d, bias %d, inverted_dst %d\n", tm->tm_year + 1900, bias, inverted_dst);
+     current_year = tm->tm_year;
+     current_bias = bias;
++    tm1 = tm2 = *tm;
++    tm1.tm_isdst = 0;
++    tm2.tm_isdst = 1;
++    {
++        /* BCD: a zone has inverse daylight saving when the same wall-clock time read as "daylight" lies exactly one
++         * hour AFTER the same time read as "standard" (measured with a negative-daylight build of Europe/Dublin, in
++         * both seasons). Wine tests only "after". Apple's C library, for a zone that has no daylight saving now,
++         * reads the "daylight" form with a daylight type from the zone's history, which is not an hour away:
++         * Asia/Singapore and Asia/Kuala_Lumpur (+2400 s, the +07:20 of 1933), America/Santo_Domingo (+1800 s),
++         * America/Danmarkshavn (+7200 s). Wine's test took those four for inverse zones and reported them one hour
++         * off (Singapore as UTC+7). No zone of Apple's data is a real inverse zone (Dublin is shipped in the form
++         * without negative daylight saving), so on iOS this is never true; the code stays for a zone that is. */
++        time_t t1 = mktime(&tm1), t2 = mktime(&tm2);
++        inverted_dst = (t1 != (time_t)-1 && t2 != (time_t)-1 && t2 - t1 == 3600);
++    }
++    if (inverted_dst) bias += 60;
++
++    memset(tzi, 0, sizeof(*tzi));
++    TRACE("tz data will be valid through year %d, bias %d, inverted_dst %d\n", tm->tm_year + 1900, bias, inverted_dst);
+ 
+     tzi->Bias = bias;
+ 
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index 10b2176..a320d8c 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -18,6 +18,12 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/*
++ * Modified by BCD, 2026-10-21 (tools/patch-wine-setupapi-devinst-lock.py): the table of device
++ * nodes (see devinst_lock) is guarded by a lock, and a new table is allocated before its size is
++ * published. Everything else in this file is as Wine's; this file stays under the license above.
++ */
++
+ #include <assert.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
+@@ -246,6 +252,15 @@ static inline void copy_device_iface_data(SP_DEVICE_INTERFACE_DATA *data,
+ static WCHAR **devinst_table;
+ static unsigned int devinst_table_size;
+ 
++/* Modified by BCD: devinst_lock guards devinst_table and devinst_table_size. Wine's code read and wrote
++ * them with no lock, and published the size before the table was allocated; two threads that listed
++ * devices at the same moment (Dying Light's libpad.dll and the game's main thread) made one of them read
++ * a NULL table. Entries are written once and never freed, so an id string stays valid after the lock is
++ * dropped even when a growth moves the table. */
++static SRWLOCK devinst_lock = SRWLOCK_INIT;
++static const char devinst_lock_tag[] __attribute__((used)) = "setupapi-devinst-lock-v1 madeira-bcd";
++
++/* Called with devinst_lock held. */
+ static DEVINST get_devinst_for_device_id(const WCHAR *id)
+ {
+     unsigned int i;
+@@ -264,26 +279,63 @@ static DEVINST alloc_devinst_for_device_id(const WCHAR *id)
+ {
+     DEVINST ret;
+ 
++    AcquireSRWLockExclusive(&devinst_lock);
+     ret = get_devinst_for_device_id(id);
+     if (ret == devinst_table_size)
+     {
++        unsigned int size = devinst_table_size ? devinst_table_size * 2 : 256;
++        WCHAR **table;
++
+         if (devinst_table)
+         {
+-            devinst_table = realloc(devinst_table, devinst_table_size * 2 * sizeof(*devinst_table));
+-            memset(devinst_table + devinst_table_size, 0, devinst_table_size * sizeof(*devinst_table));
+-            devinst_table_size *= 2;
++            if ((table = realloc(devinst_table, size * sizeof(*table))))
++                memset(table + devinst_table_size, 0, (size - devinst_table_size) * sizeof(*table));
+         }
+         else
++            table = calloc(size, sizeof(*table));
++        if (!table)
+         {
+-            devinst_table_size = 256;
+-            devinst_table = calloc(devinst_table_size, sizeof(*devinst_table));
++            /* Out of memory: nothing was changed. -1 is no device node (every reader refuses a
++             * node at or past the size), where Wine's code dereferenced the NULL result. */
++            ReleaseSRWLockExclusive(&devinst_lock);
++            return -1;
+         }
++        TRACE("%s: device node table %p, %u entries\n", devinst_lock_tag, table, size);
++        devinst_table = table;       /* the table first, then the size that says how big it is */
++        devinst_table_size = size;
+     }
+     if (!devinst_table[ret])
+         devinst_table[ret] = wcsdup(id);
++    ReleaseSRWLockExclusive(&devinst_lock);
+     return ret;
+ }
+ 
++/* The id string of a device node, or NULL when there is none. The string stays valid after the lock is
++ * dropped (see devinst_lock). */
++static const WCHAR *get_devnode_id(DEVINST devnode)
++{
++    const WCHAR *id = NULL;
++
++    AcquireSRWLockExclusive(&devinst_lock);
++    if (devnode < devinst_table_size) id = devinst_table[devnode];
++    ReleaseSRWLockExclusive(&devinst_lock);
++    return id;
++}
++
++/* The device node of an id that is in the table. */
++static BOOL locate_devnode(const WCHAR *id, DEVINST *devnode)
++{
++    DEVINST ret;
++    BOOL found;
++
++    AcquireSRWLockExclusive(&devinst_lock);
++    ret = get_devinst_for_device_id(id);
++    found = ret < devinst_table_size && devinst_table[ret];
++    ReleaseSRWLockExclusive(&devinst_lock);
++    if (found) *devnode = ret;
++    return found;
++}
++
+ static void SETUPDI_GuidToString(const GUID *guid, LPWSTR guidStr)
+ {
+     swprintf(guidStr, 39, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+@@ -896,9 +948,11 @@ static struct device *create_device(struct DeviceInfoSet *set,
+ 
+ static struct device *get_devnode_device(DEVINST devnode, HDEVINFO *set, SP_DEVINFO_DATA *data)
+ {
++    const WCHAR *id;
++
+     data->cbSize = sizeof(*data);
+     *set = NULL;
+-    if (devnode >= devinst_table_size || !devinst_table[devnode])
++    if (!(id = get_devnode_id(devnode)))
+     {
+         WARN("device node %lu not found\n", devnode);
+         return NULL;
+@@ -906,7 +960,7 @@ static struct device *get_devnode_device(DEVINST devnode, HDEVINFO *set, SP_DEVI
+ 
+     *set = SetupDiCreateDeviceInfoListExW(NULL, NULL, NULL, NULL);
+     if (*set == INVALID_HANDLE_VALUE) return NULL;
+-    if (!SetupDiOpenDeviceInfoW(*set, devinst_table[devnode], NULL, 0, data))
++    if (!SetupDiOpenDeviceInfoW(*set, id, NULL, 0, data))
+     {
+         SetupDiDestroyDeviceInfoList(*set);
+         *set = NULL;
+@@ -4262,12 +4316,14 @@ BOOL WINAPI SetupDiDeleteDevRegKey(HDEVINFO devinfo, SP_DEVINFO_DATA *device_dat
+  */
+ CONFIGRET WINAPI CM_Get_Device_IDA(DEVINST devnode, char *buffer, ULONG len, ULONG flags)
+ {
++    const WCHAR *id;
++
+     TRACE("%lu, %p, %lu, %#lx\n", devnode, buffer, len, flags);
+ 
+-    if (devnode >= devinst_table_size || !devinst_table[devnode])
++    if (!(id = get_devnode_id(devnode)))
+         return CR_NO_SUCH_DEVINST;
+ 
+-    WideCharToMultiByte(CP_ACP, 0, devinst_table[devnode], -1, buffer, len, 0, 0);
++    WideCharToMultiByte(CP_ACP, 0, id, -1, buffer, len, 0, 0);
+     TRACE("Returning %s\n", debugstr_a(buffer));
+     return CR_SUCCESS;
+ }
+@@ -4277,12 +4333,14 @@ CONFIGRET WINAPI CM_Get_Device_IDA(DEVINST devnode, char *buffer, ULONG len, ULO
+  */
+ CONFIGRET WINAPI CM_Get_Device_IDW(DEVINST devnode, WCHAR *buffer, ULONG len, ULONG flags)
+ {
++    const WCHAR *id;
++
+     TRACE("%lu, %p, %lu, %#lx\n", devnode, buffer, len, flags);
+ 
+-    if (devnode >= devinst_table_size || !devinst_table[devnode])
++    if (!(id = get_devnode_id(devnode)))
+         return CR_NO_SUCH_DEVINST;
+ 
+-    lstrcpynW(buffer, devinst_table[devnode], len);
++    lstrcpynW(buffer, id, len);
+     TRACE("Returning %s\n", debugstr_w(buffer));
+     return CR_SUCCESS;
+ }
+@@ -4292,12 +4350,14 @@ CONFIGRET WINAPI CM_Get_Device_IDW(DEVINST devnode, WCHAR *buffer, ULONG len, UL
+  */
+ CONFIGRET WINAPI CM_Get_Device_ID_Size(ULONG *len, DEVINST devnode, ULONG flags)
+ {
++    const WCHAR *id;
++
+     TRACE("%p, %lu, %#lx\n", len, devnode, flags);
+ 
+-    if (devnode >= devinst_table_size || !devinst_table[devnode])
++    if (!(id = get_devnode_id(devnode)))
+         return CR_NO_SUCH_DEVINST;
+ 
+-    *len = lstrlenW(devinst_table[devnode]);
++    *len = lstrlenW(id);
+     return CR_SUCCESS;
+ }
+ 
+@@ -4373,7 +4433,7 @@ CONFIGRET WINAPI CM_Locate_DevNode_ExW(DEVINST *devinst, DEVINSTID_W device_id,
+         return CR_CALL_NOT_IMPLEMENTED;
+     }
+ 
+-    if ((ret = get_devinst_for_device_id(device_id)) < devinst_table_size && devinst_table[ret])
++    if (locate_devnode(device_id, &ret))
+     {
+         *devinst = ret;
+         return CR_SUCCESS;
+diff --git a/dlls/shell32/ebrowser.c b/dlls/shell32/ebrowser.c
+index 8ae09d4..7816223 100644
+--- a/dlls/shell32/ebrowser.c
++++ b/dlls/shell32/ebrowser.c
+@@ -656,6 +656,9 @@ static LRESULT navpane_on_wm_size_move(ExplorerBrowserImpl *This)
+ 
+ static LRESULT navpane_on_wm_destroy(ExplorerBrowserImpl *This)
+ {
++    /* madeira-bcd: navpane null (tools/patch-wine-shell32-navpane-null.py, night round 2026-11-11, A4 S5): when explorerframe.dll is missing the tree control
++     * was never created (navpane_on_wm_create failed and left pnstc2 NULL); closing the window must not call through it. */
++    if (!This->navpane.pnstc2) return TRUE;
+     INameSpaceTreeControl2_TreeUnadvise(This->navpane.pnstc2, This->navpane.nstc_cookie);
+     INameSpaceTreeControl2_Release(This->navpane.pnstc2);
+     This->navpane.pnstc2 = NULL;
+diff --git a/dlls/win32u/font.c b/dlls/win32u/font.c
+index 9af546a..f7f748f 100644
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -5159,6 +5159,12 @@ BOOL WINAPI NtGdiEnumFonts( HDC hdc, ULONG type, ULONG win32_compat, ULONG face_
+ 
+     memset( &lf, 0, sizeof(lf) );
+     lf.lfCharSet = charset;
++    /* madeira-bcd: NtGdiEnumFonts face name (tools/patch-wine-enumfonts-facename.py, night round 2026-11-11, FINAL FANTASY VII's Qt 4 launcher, 9J06NQ):
++     * gdi32's EnumFontFamiliesExW passes lstrlenW(lf->lfFaceName). A LOGFONTW whose face name holds 32 characters and no terminator
++     * (Qt 4 copies qMin(length + 1, 32) characters of a family name of 32 or more) makes that 33, and the copy overran the 32-WCHAR
++     * field of `lf`: the iOS SDK fortifies memcpy, so the host aborted in __chk_fail_overflow and the program ended with c0000026.
++     * A name that does not fit is cut to 31 characters (the field keeps its terminator); 32 or fewer are copied as before. */
++    if (face_name_len > LF_FACESIZE) face_name_len = LF_FACESIZE - 1;
+     if (face_name_len) memcpy( lf.lfFaceName, face_name, face_name_len * sizeof(WCHAR) );
+ 
+     fe.hdc     = hdc;
+diff --git a/dlls/wow64/security.c b/dlls/wow64/security.c
+index 99c585d..f1ef5ac 100644
+--- a/dlls/wow64/security.c
++++ b/dlls/wow64/security.c
+@@ -474,6 +474,13 @@ NTSTATUS WINAPI wow64_NtQueryInformationToken( UINT *args )
+         status = NtQueryInformationToken( handle, class, &buffer, sizeof(buffer), &ret_size );
+         if (status) return status;
+         sid = owner->Owner;
++        if (!sid)   /* madeira-bcd: NULL SID (tools/patch-wine-wow64-token-null-sid.py; round 624, Garry's Mod): TokenAppContainerSid of a token that is not an AppContainer's */
++        {
++            if (len >= sizeof(*owner32)) owner32->Owner = 0;
++            else status = STATUS_BUFFER_TOO_SMALL;
++            if (retlen) *retlen = sizeof(*owner32);
++            return status;
++        }
+         sid_len = offsetof( SID, SubAuthority[sid->SubAuthorityCount] );
+         if (len >= sizeof(*owner32) + sid_len)
+         {
+diff --git a/dlls/xaudio2_7/xaudio_dll.c b/dlls/xaudio2_7/xaudio_dll.c
+index fe9351e..d9031e2 100644
+--- a/dlls/xaudio2_7/xaudio_dll.c
++++ b/dlls/xaudio2_7/xaudio_dll.c
+@@ -469,6 +469,36 @@ static const FAudioVoiceCallback FAudioVoiceCallback_Vtbl = {
+     XA2VCB_OnVoiceProcessingPassStart
+ };
+ 
++/* madeira-bcd: xaudio2 engine callbacks (tools/patch-wine-xaudio2-callbacks.py, round 630, Skyrim 93EMSH): with env
++ * MADEIRA_XAUDIO2_CALLBACK_ORDER=1 (only the exact value 1) RegisterForCallbacks publishes the array before the count and the
++ * engine-callback passes, which FAudio's audio thread runs without the engine's lock, read the count before the array. The old
++ * order (count, realloc, store) let a pass see the new count with a NULL array. Unset, 0 or anything else: unchanged. */
++static BOOL xa2_callback_order(void)
++{
++    static LONG enabled = -1;
++
++    if (enabled < 0)
++    {
++        WCHAR value[4];
++        DWORD err = GetLastError();
++        DWORD len = GetEnvironmentVariableW( L"MADEIRA_XAUDIO2_CALLBACK_ORDER", value, ARRAY_SIZE(value) );
++        LONG on = (len == 1 && value[0] == '1');
++        SetLastError( err );
++        if (InterlockedCompareExchange( &enabled, on, -1 ) == -1 && on)
++            ERR( "[xaudio2-cb] MADEIRA_XAUDIO2_CALLBACK_ORDER=1: callbacks are published before their count\n" );
++    }
++    return enabled > 0;
++}
++
++/* the count first, then the array (RegisterForCallbacks publishes them in the opposite order) */
++static UINT32 xa2_callbacks_snapshot(IXAudio2Impl *This, IXAudio2EngineCallback ***cbs)
++{
++    UINT32 n = *(volatile UINT32 *)&This->ncbs;
++    MemoryBarrier();
++    *cbs = *(IXAudio2EngineCallback ** volatile *)&This->cbs;
++    return *cbs ? n : 0;
++}
++
+ /* Engine Callbacks */
+ 
+ static inline IXAudio2Impl *impl_from_FAudioEngineCallback(FAudioEngineCallback *iface)
+@@ -481,6 +511,14 @@ static void FAUDIOCALL XA2ECB_OnProcessingPassStart(FAudioEngineCallback *iface)
+     IXAudio2Impl *This = impl_from_FAudioEngineCallback(iface);
+     int i;
+     TRACE("%p\n", This);
++    if (xa2_callback_order())   /* madeira-bcd: xaudio2 engine callbacks */
++    {
++        IXAudio2EngineCallback **cbs;
++        UINT32 n = xa2_callbacks_snapshot(This, &cbs);
++        for(i = 0; i < n && cbs[i]; ++i)
++            IXAudio2EngineCallback_OnProcessingPassStart(cbs[i]);
++        return;
++    }
+     for(i = 0; i < This->ncbs && This->cbs[i]; ++i)
+         IXAudio2EngineCallback_OnProcessingPassStart(This->cbs[i]);
+ }
+@@ -490,6 +528,14 @@ static void FAUDIOCALL XA2ECB_OnProcessingPassEnd(FAudioEngineCallback *iface)
+     IXAudio2Impl *This = impl_from_FAudioEngineCallback(iface);
+     int i;
+     TRACE("%p\n", This);
++    if (xa2_callback_order())   /* madeira-bcd: xaudio2 engine callbacks */
++    {
++        IXAudio2EngineCallback **cbs;
++        UINT32 n = xa2_callbacks_snapshot(This, &cbs);
++        for(i = 0; i < n && cbs[i]; ++i)
++            IXAudio2EngineCallback_OnProcessingPassEnd(cbs[i]);
++        return;
++    }
+     for(i = 0; i < This->ncbs && This->cbs[i]; ++i)
+         IXAudio2EngineCallback_OnProcessingPassEnd(This->cbs[i]);
+ }
+@@ -500,6 +546,14 @@ static void FAUDIOCALL XA2ECB_OnCriticalError(FAudioEngineCallback *iface,
+     IXAudio2Impl *This = impl_from_FAudioEngineCallback(iface);
+     int i;
+     TRACE("%p\n", This);
++    if (xa2_callback_order())   /* madeira-bcd: xaudio2 engine callbacks */
++    {
++        IXAudio2EngineCallback **cbs;
++        UINT32 n = xa2_callbacks_snapshot(This, &cbs);
++        for(i = 0; i < n && cbs[i]; ++i)
++            IXAudio2EngineCallback_OnCriticalError(cbs[i], error);
++        return;
++    }
+     for(i = 0; i < This->ncbs && This->cbs[i]; ++i)
+         IXAudio2EngineCallback_OnCriticalError(This->cbs[i], error);
+ }
+@@ -1550,6 +1604,29 @@ static HRESULT WINAPI IXAudio2Impl_RegisterForCallbacks(IXAudio2 *iface,
+         }
+     }
+ 
++    if (xa2_callback_order())   /* madeira-bcd: xaudio2 engine callbacks */
++    {
++        /* a new array, filled, then published, then the count (i == This->ncbs here). The old array stays allocated: a pass
++         * on the audio thread may still be reading it. */
++        IXAudio2EngineCallback **cbs = malloc((This->ncbs + 1) * sizeof(*cbs));
++        UINT32 k;
++
++        if (!cbs)
++        {
++            LeaveCriticalSection(&This->lock);
++            return E_OUTOFMEMORY;
++        }
++        for (k = 0; k < This->ncbs; ++k)
++            cbs[k] = This->cbs[k];
++        cbs[i] = pCallback;
++        MemoryBarrier();
++        *(IXAudio2EngineCallback ** volatile *)&This->cbs = cbs;
++        MemoryBarrier();
++        *(volatile UINT32 *)&This->ncbs = i + 1;
++        LeaveCriticalSection(&This->lock);
++        return S_OK;
++    }
++
+     This->ncbs++;
+     This->cbs = realloc(This->cbs, This->ncbs * sizeof(*This->cbs));
+ 

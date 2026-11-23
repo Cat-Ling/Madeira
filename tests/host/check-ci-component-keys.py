@@ -54,6 +54,8 @@ cases = {
     'cargo-config': ('.cargo/config.toml', {'rppairing', 'ipa'}),
     'rust-toolchain': ('rust-toolchain.toml', {'rppairing', 'ipa'}),
     'fex-inner-recipe': ('build/fex-ios/build.sh', {'fex', 'ipa'}),
+    'fex-patches': ('build/fex-patches/0001-windows-ios-smc-traps-per-16k-host-page.patch', {'fex', 'ipa'}),
+    'wine-patches': ('build/wine-patches/0001-bcd-wine-core-correctness-and-perf.patch', {'wine-host', 'i386', 'ipa'}),
     'docs': ('BUILDING.md', {'ipa'}),
     'workflow': ('.github/workflows/build.yml', {'ipa'}),
 }

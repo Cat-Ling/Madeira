@@ -17,6 +17,8 @@ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 OBJ_DIR="$BUILD_DIR/obj"
 APP_LIB="$REPO_ROOT/app/Madeira/libwin32u_unix.a"
 
+bash "$REPO_ROOT/build/wine-patches/apply.sh"
+
 mkdir -p "$OBJ_DIR"
 
 # Optional Vulkan route; do not change the normal native build.
