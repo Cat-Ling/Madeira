@@ -792,7 +792,8 @@ check(id(steam + #"\Borderlands 2"#, 49520) == "borderlands-2" && id(steam + #"\
 check(id(steam + #"\Borderlands The Pre-Sequel"#, 261640) == "none", "the Pre-Sequel has no list")
 check(id(steam + #"\Batman Arkham City GOTY"#, 200260) == "batman-arkham-city-goty"
       && id(steam + #"\Batman Arkham City"#, 57400) == "batman-arkham-city-goty"
-      && id(steam + #"\Batman Arkham City GOTY\Binaries\Win32\BatmanAC.exe"#) == "batman-arkham-city-goty", "Arkham City by App ID, folder and program")
+      && id(steam + #"\Batman Arkham City GOTY\Binaries\Win32\BatmanAC.exe"#) == "batman-arkham-city-goty"
+      && id(#"D:\Games\Batman - Arkham City\Binaries\Win32\BatmanAC.exe"#) == "batman-arkham-city-goty", "Arkham City by App ID, folder and program")
 check(R.batmanArkhamCityGoty.switchSummary == "older NVIDIA card on", R.batmanArkhamCityGoty.switchSummary)
 check(id(steam + #"\Call of Duty Black Ops"#, 42700) == "black-ops-1" && id(steam + #"\Call of Duty Black Ops"#) == "black-ops-1"
       && id(steam + #"\Call of Duty Black Ops\BlackOps.exe"#) == "black-ops-1", "the first Black Ops by App ID, folder and program")

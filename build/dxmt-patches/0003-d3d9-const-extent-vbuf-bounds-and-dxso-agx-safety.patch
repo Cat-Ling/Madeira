@@ -1,0 +1,165 @@
+diff --git a/src/airconv/air_operations.hpp b/src/airconv/air_operations.hpp
+index 2754169..adc987d 100644
+--- a/src/airconv/air_operations.hpp
++++ b/src/airconv/air_operations.hpp
+@@ -88,6 +88,8 @@ enum class MTLAttributeFormat {
+   FloatRGB9E5 = 55,
+ };
+ 
++extern thread_local int madeira_vfetch_align1;
++
+ AIRBuilderResult pull_vec4_from_addr(
+   MTLAttributeFormat format, pvalue base_addr, pvalue byte_offset
+ );
+diff --git a/src/airconv/dxso_compile.cpp b/src/airconv/dxso_compile.cpp
+index a129694..b67fba7 100644
+--- a/src/airconv/dxso_compile.cpp
++++ b/src/airconv/dxso_compile.cpp
+@@ -1324,8 +1324,14 @@ compile_dxso(
+           .types = types,
+           .air = air,
+       };
++      static const bool vfetch_align1 = [] {
++        const char *e = std::getenv("MADEIRA_VFETCH_ALIGN1");
++        return !(e && e[0] == '0');
++      }();
++      air::madeira_vfetch_align1 = vfetch_align1 ? 1 : 0;
+       auto result =
+           air::pull_vec4_from_addr((air::MTLAttributeFormat)element.format, base_addr, byte_offset).build(abctx);
++      air::madeira_vfetch_align1 = 0;
+       if (auto err = result.takeError()) {
+         // Unsupported MTLAttributeFormat (gaps in pull_vec4_from_addr_checked).
+         // Fail open: zero-fill so the rest of the shader still
+@@ -2297,12 +2303,26 @@ compile_dxso(
+     case DxsoOpcode::Mul:
+       fold_binary(ins, [&](Value *a, Value *b) { return builder.CreateFMul(a, b); });
+       break;
+-    case DxsoOpcode::Min:
+-      fold_binary(ins, [&](Value *a, Value *b) { return air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, a, b); });
++    case DxsoOpcode::Min: {
++      static const bool fast_minmax = [] {
++        const char *e = std::getenv("DXMT_PRECISE_MINMAX");
++        return e && e[0] == '0';
++      }();
++      fold_binary(ins, [&](Value *a, Value *b) {
++        return air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, a, b, /*FastVariant=*/fast_minmax);
++      });
+       break;
+-    case DxsoOpcode::Max:
+-      fold_binary(ins, [&](Value *a, Value *b) { return air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, a, b); });
++    }
++    case DxsoOpcode::Max: {
++      static const bool fast_minmax = [] {
++        const char *e = std::getenv("DXMT_PRECISE_MINMAX");
++        return e && e[0] == '0';
++      }();
++      fold_binary(ins, [&](Value *a, Value *b) {
++        return air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, a, b, /*FastVariant=*/fast_minmax);
++      });
+       break;
++    }
+     case DxsoOpcode::Slt:
+       // (a < b) ? 1.0 : 0.0, lane-wise. Ordered compare; NaN inputs
+       // pick the 0.0 side, matching DXVK's opFOrdLessThan.
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 6da7305..171abd1 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -8998,8 +8998,14 @@ MTLD3D9Device::PackDrawConstants(
+   // 256 and the hot path is unchanged.
+   const uint32_t vs_file_size =
+       pod.vs_const_F_overflow ? (D3D9_MAX_VS_CONST_F + pod.vs_const_F_overflow_count) : D3D9_MAX_VS_CONST_F;
+-  uint32_t vs_f_regs = resolve_const_f_extent(pod.vs_const_f_max, vs_uses_relative, vs_file_size);
+-  uint32_t ps_f_regs = resolve_const_f_extent(pod.ps_const_f_max, ps_uses_relative, D3D9_MAX_PS_CONST_F);
++  // Include the shader's highest static float-constant read so an unset cN
++  // resolves to the zero-initialized shadow instead of past the sub-buffer.
++  const uint32_t vs_shader_regs = (!ffp_vs && vs) ? vs->metadata().max_float_const_index : 0u;
++  const uint32_t ps_shader_regs = ps ? ps->metadata().max_float_const_index : 0u;
++  uint32_t vs_f_regs =
++      resolve_const_f_extent(std::max<uint32_t>(pod.vs_const_f_max, vs_shader_regs), vs_uses_relative, vs_file_size);
++  uint32_t ps_f_regs =
++      resolve_const_f_extent(std::max<uint32_t>(pod.ps_const_f_max, ps_shader_regs), ps_uses_relative, D3D9_MAX_PS_CONST_F);
+   // A generated vertex shader reads the fixed-function uniforms block
+   // through this slot; size it for the full layout contract (matrix,
+   // fog, point-scale and lighting blocks) rather than the register
+@@ -9290,6 +9296,8 @@ MTLD3D9Device::PackDrawConstants(
+   const_cache.pod_ptr = bd.pod_snapshot;
+   const_cache.vs_defs_key = vs_defs_key;
+   const_cache.ps_defs_key = ps_defs_key;
++  const_cache.vs_f_regs = vs_f_regs;
++  const_cache.ps_f_regs = ps_f_regs;
+   const_cache.ffp_texcoord_width_key = ffp_tcw_key;
+   const_cache.ds_bound = ds_bound;
+   const_cache.pos_transformed = res.resolved_position_transformed;
+@@ -10667,7 +10675,8 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
+       // the latest slot.
+       entry.base_addr = cap.vb_slots[slot].gpu_address + cap.vb_slots[slot].offset;
+       entry.stride = cap.vb_slots[slot].stride;
+-      entry.length = vb->size();
++      const uint32_t vb_size = vb->size();
++      entry.length = vb_size > cap.vb_slots[slot].offset ? (vb_size - cap.vb_slots[slot].offset) : 0u;
+     }
+     // Per-slot keys for the comparison key (also packs nicely into
+     // contiguous arrays for the cache miss path's update).
+@@ -10794,12 +10803,21 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
+   // SetVertexDeclaration / SetDepthStencilSurface between two same-pod draws
+   // would otherwise reuse stale bytes; key them here. ffp_texcoord_width stays
+   // its default for non-FFP draws, so this is free of extra misses there.
++  const uint32_t vs_file_size =
++      pod.vs_const_F_overflow ? (D3D9_MAX_VS_CONST_F + pod.vs_const_F_overflow_count) : D3D9_MAX_VS_CONST_F;
++  const uint32_t vs_shader_regs = (!ffp_vs && vs) ? vs->metadata().max_float_const_index : 0u;
++  const uint32_t ps_shader_regs = ps ? ps->metadata().max_float_const_index : 0u;
++  const uint32_t vs_f_regs_needed =
++      resolve_const_f_extent(std::max<uint32_t>(pod.vs_const_f_max, vs_shader_regs), vs_uses_relative, vs_file_size);
++  const uint32_t ps_f_regs_needed =
++      resolve_const_f_extent(std::max<uint32_t>(pod.ps_const_f_max, ps_shader_regs), ps_uses_relative, D3D9_MAX_PS_CONST_F);
+   uint32_t ffp_tcw_key = 0;
+   for (int i = 0; i < 8; ++i)
+     ffp_tcw_key |= (ffp_texcoord_width[i] & 0xFu) << (i * 4);
+   const bool ds_bound = res.resolved_ds_handle != 0;
+   if (bd.pod_snapshot == const_cache.pod_ptr && const_cache.pod_ptr != nullptr &&
+       const_cache.vs_defs_key == vs_defs_key && const_cache.ps_defs_key == ps_defs_key &&
++      const_cache.vs_f_regs >= vs_f_regs_needed && const_cache.ps_f_regs >= ps_f_regs_needed &&
+       const_cache.ffp_texcoord_width_key == ffp_tcw_key && const_cache.ds_bound == ds_bound &&
+       const_cache.pos_transformed == res.resolved_position_transformed) {
+     res.resolved_const_uploads = const_cache.uploads;
+diff --git a/src/d3d9/d3d9_device.hpp b/src/d3d9/d3d9_device.hpp
+index ca4d316..f0cf530 100644
+--- a/src/d3d9/d3d9_device.hpp
++++ b/src/d3d9/d3d9_device.hpp
+@@ -1199,6 +1199,8 @@ private:
+     // shader switches for the common case.
+     const void *vs_defs_key = nullptr;
+     const void *ps_defs_key = nullptr;
++    uint32_t vs_f_regs = 0;
++    uint32_t ps_f_regs = 0;
+     // Two upload inputs that are NOT carried on pod_snapshot and so must key
+     // this cache separately, or a same-pod hit reuses stale bytes:
+     //   - ffp_texcoord_width (packed): the generated FFP texture-matrix fold
+diff --git a/src/d3d9/d3d9_interface.cpp b/src/d3d9/d3d9_interface.cpp
+index 06b7e56..d4b5af0 100644
+--- a/src/d3d9/d3d9_interface.cpp
++++ b/src/d3d9/d3d9_interface.cpp
+@@ -938,7 +938,8 @@ MTLD3D9Interface::CheckDeviceFormatProbe(
+   // per-format FILTERING cap); the sampler translation degrades a LINEAR
+   // request over these formats to point anyway. Every other format falls
+   // through to the per-type probe below and reports filterable as before.
+-  if ((Usage & D3DUSAGE_QUERY_FILTER) && IsMetalNonFilterableFormat(CheckFormat))
++  if ((Usage & (D3DUSAGE_QUERY_FILTER | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING)) &&
++      IsMetalNonFilterableFormat(CheckFormat))
+     return D3DERR_NOTAVAILABLE;
+ 
+   auto isSamplable2D = [&](D3DFORMAT f) {
+diff --git a/src/d3d9/d3d9_shader.cpp b/src/d3d9/d3d9_shader.cpp
+index ff97c91..a0fe808 100644
+--- a/src/d3d9/d3d9_shader.cpp
++++ b/src/d3d9/d3d9_shader.cpp
+@@ -232,7 +232,7 @@ log_shader_dump(
+ // the three codegen changes that needed it, and the failure is silent and
+ // durable, because the cache is keyed by executable and outlives the build that
+ // wrote it.
+-static constexpr uint32_t kD9ShaderCacheEpoch = 11;
++static constexpr uint32_t kD9ShaderCacheEpoch = 12;
+ 
+ static bool
+ hash_dxso_args(Sha1HashState &h, const DXSO_SHADER_COMPILATION_ARGUMENT_DATA *args) {
