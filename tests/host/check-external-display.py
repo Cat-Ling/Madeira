@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host checks for dedicated External Display Console Mode, aspect/overscan math, and wiring."""
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -111,6 +112,28 @@ check("Library.swift isolates gamepad input when TV Console owns input", "!Exter
 check("HardwareInput.swift routes keyboard/mouse to TV Console", "ExternalConsoleController.shared.handleKey" in hw and "ExternalConsoleController.shared.moveCursor" in hw and "consoleInputActive" in hw)
 check("FPSOverlay.swift honors active external display refresh rate", "ExternalDisplay.currentActiveMaxFPS" in fps)
 check("GuestDisplay.swift applies externalResolutionOverride", "externalResolutionOverride" in guest_src)
+
+plist = plistlib.loads((APP / "Info.plist").read_bytes())
+manifest = plist.get("UIApplicationSceneManifest") or {}
+configs = manifest.get("UISceneConfigurations") or {}
+ext_configs = configs.get("UIWindowSceneSessionRoleExternalDisplayNonInteractive") or []
+check(
+    "Info.plist declares UIWindowSceneSessionRoleExternalDisplayNonInteractive scene delegate",
+    bool(ext_configs) and ext_configs[0].get("UISceneDelegateClassName") == "MadeiraExternalDisplaySceneDelegate",
+    ext_configs,
+)
+check(
+    "Info.plist leaves UIWindowSceneSessionRoleApplication unmanaged for SwiftUI WindowGroup",
+    "UIWindowSceneSessionRoleApplication" not in configs,
+)
+check(
+    "ExternalDisplayConsole.swift implements MadeiraExternalDisplaySceneDelegate",
+    "@objc(MadeiraExternalDisplaySceneDelegate)" in ext_src
+    and "UIWindowSceneDelegate" in ext_src
+    and "attachExternalScene" in ext_src
+    and "detachExternalScene" in ext_src
+    and "overscanCompensation = .none" in ext_src,
+)
 
 print("PASS: ExternalDisplay Console & Companion wiring" if ok else "FAILED: ExternalDisplay Console & Companion checks")
 sys.exit(0 if ok else 1)
