@@ -14,6 +14,7 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Cat-Ling/Madeira/tools/aol/protocol"
@@ -128,21 +129,34 @@ type linuxDevice struct {
 	hasFF     bool
 }
 
+type evdevKey struct {
+	dev  *linuxDevice
+	code uint16
+}
+
 type linuxCapturer struct {
-	opts      Options
-	mu        sync.Mutex
-	devices   []*linuxDevice
-	grabbed   bool
-	held      []uint16
-	mouseBtns uint8
-	keyboards int
-	mice      int
-	gamepads  int
+	opts          Options
+	mu            sync.Mutex
+	devices       []*linuxDevice
+	grabbed       bool
+	pendingGrab   bool
+	pendingUngrab bool
+	held          []uint16
+	heldEv        map[evdevKey]struct{}
+	mouseBtns     uint8
+	keyboards     int
+	mice          int
+	gamepads      int
+	grabFn        func(on bool)
 }
 
 // New creates a platform input Capturer for Linux evdev devices.
 func New(opts Options) (Capturer, error) {
-	c := &linuxCapturer{opts: opts, grabbed: opts.Grab}
+	c := &linuxCapturer{
+		opts:    opts,
+		grabbed: opts.Grab,
+		heldEv:  make(map[evdevKey]struct{}),
+	}
 	if err := c.openDevices(); err != nil {
 		return nil, err
 	}
@@ -163,6 +177,9 @@ func (c *linuxCapturer) Summary() Summary {
 func (c *linuxCapturer) Run(ctx context.Context) error {
 	defer c.closeAll()
 	if c.grabbed {
+		// Wait briefly for startup keys (e.g. Enter) to be released so the host
+		// compositor/TTY receives the key-up before EVIOCGRAB takes ownership.
+		c.waitKeysReleased(ctx, 500*time.Millisecond)
 		c.applyGrab(true)
 	}
 
@@ -354,6 +371,7 @@ func inspectLinuxDevice(f *os.File, path string, rw bool, opts Options, padSlot 
 }
 
 func (c *linuxCapturer) readDevice(ctx context.Context, d *linuxDevice, evSize int) {
+	defer c.clearDeviceKeys(d)
 	buf := make([]byte, evSize*64)
 	for ctx.Err() == nil {
 		n, err := d.file.Read(buf)
@@ -370,39 +388,124 @@ func (c *linuxCapturer) readDevice(ctx context.Context, d *linuxDevice, evSize i
 	}
 }
 
+func (c *linuxCapturer) clearDeviceKeys(d *linuxDevice) {
+	var (
+		applyGrabOn  bool
+		applyGrabOff bool
+		emitGrabbed  bool
+	)
+	c.mu.Lock()
+	for k := range c.heldEv {
+		if k.dev == d {
+			delete(c.heldEv, k)
+			if hid := protocol.LinuxEvdevToHID(k.code); hid != 0 {
+				c.held = slices.DeleteFunc(c.held, func(u uint16) bool { return u == hid })
+			}
+		}
+	}
+	if len(c.heldEv) == 0 {
+		if c.pendingGrab {
+			c.pendingGrab = false
+			c.grabbed = true
+			applyGrabOn = c.opts.Grab
+			emitGrabbed = true
+		} else if c.pendingUngrab {
+			c.pendingUngrab = false
+			applyGrabOff = true
+		}
+	}
+	c.mu.Unlock()
+	if applyGrabOn {
+		c.applyGrab(true)
+	} else if applyGrabOff {
+		c.applyGrab(false)
+	}
+	if emitGrabbed && c.opts.OnEvent != nil {
+		c.opts.OnEvent(Event{Kind: EventCaptureToggled, Grabbed: true})
+	}
+}
+
 func (c *linuxCapturer) processDeviceBatch(d *linuxDevice, events []RawInputEvent) {
 	var (
 		dx, dy, wx, wy int32
 		mouseDirty     bool
 		padDirty       bool
-		toggleGrab     bool
+		applyGrabOn    bool
+		applyGrabOff   bool
+		emitToggle     bool
+		emitGrabState  bool
 	)
 
 	c.mu.Lock()
+	if c.heldEv == nil {
+		c.heldEv = make(map[evdevKey]struct{})
+	}
 	for _, ev := range events {
 		switch ev.Type {
 		case evKey:
 			if d.isKB && ev.Value != 2 {
+				ek := evdevKey{dev: d, code: ev.Code}
+				pressed := ev.Value != 0
+				_, wasDown := c.heldEv[ek]
+				if pressed {
+					c.heldEv[ek] = struct{}{}
+				} else {
+					delete(c.heldEv, ek)
+				}
+
 				if hid := protocol.LinuxEvdevToHID(ev.Code); hid != 0 {
-					pressed := ev.Value != 0
+					var chordTriggered bool
 					if pressed {
 						if !slices.Contains(c.held, hid) {
 							c.held = append(c.held, hid)
 						}
-						if hid == protocol.HIDKeyG &&
+						if !wasDown && hid == protocol.HIDKeyG &&
 							(slices.Contains(c.held, protocol.HIDLeftCtrl) || slices.Contains(c.held, protocol.HIDRightCtrl)) &&
 							(slices.Contains(c.held, protocol.HIDLeftAlt) || slices.Contains(c.held, protocol.HIDRightAlt)) {
-							toggleGrab = true
+							chordTriggered = true
+							if c.grabbed {
+								// Stop forwarding to Madeira immediately and notify iOS
+								// to release held keys, but keep EVIOCGRAB until all
+								// chord keys are released so repeats/releases do not leak
+								// to the host terminal.
+								c.grabbed = false
+								c.mouseBtns = 0
+								if c.opts.Grab {
+									c.pendingUngrab = true
+								}
+								c.pendingGrab = false
+								emitToggle = true
+								emitGrabState = false
+							} else if !c.pendingGrab && !c.pendingUngrab {
+								// Defer EVIOCGRAB until the user releases all chord keys
+								// so the host OS receives every key-up and never gets
+								// stuck repeating Ctrl+Alt+G.
+								c.pendingGrab = true
+							}
 						}
 					} else {
 						c.held = slices.DeleteFunc(c.held, func(u uint16) bool { return u == hid })
 					}
-					if c.grabbed && !toggleGrab && c.opts.OnEvent != nil {
+
+					if c.grabbed && !chordTriggered && c.opts.OnEvent != nil {
 						heldCopy := slices.Clone(c.held)
 						c.emitLocked(Event{
 							Kind: EventKey,
 							Key:  protocol.KeyEvent{HIDUsage: hid, Pressed: pressed, Held: heldCopy},
 						})
+					}
+				}
+
+				if !pressed && len(c.heldEv) == 0 {
+					if c.pendingGrab {
+						c.pendingGrab = false
+						c.grabbed = true
+						applyGrabOn = c.opts.Grab
+						emitToggle = true
+						emitGrabState = true
+					} else if c.pendingUngrab {
+						c.pendingUngrab = false
+						applyGrabOff = true
 					}
 				}
 			}
@@ -442,10 +545,10 @@ func (c *linuxCapturer) processDeviceBatch(d *linuxDevice, events []RawInputEven
 					dy += ev.Value
 					mouseDirty = true
 				case relWheel:
-					wy += ev.Value * 120
+					wy += ev.Value
 					mouseDirty = true
 				case relHWheel:
-					wx += ev.Value * 120
+					wx += ev.Value
 					mouseDirty = true
 				}
 			}
@@ -495,19 +598,13 @@ func (c *linuxCapturer) processDeviceBatch(d *linuxDevice, events []RawInputEven
 	}
 	c.mu.Unlock()
 
-	if toggleGrab {
-		c.mu.Lock()
-		next := !c.grabbed
-		c.grabbed = next
-		if !next {
-			c.held = nil
-			c.mouseBtns = 0
-		}
-		c.mu.Unlock()
-		c.applyGrab(next)
-		if c.opts.OnEvent != nil {
-			c.opts.OnEvent(Event{Kind: EventCaptureToggled, Grabbed: next})
-		}
+	if applyGrabOn {
+		c.applyGrab(true)
+	} else if applyGrabOff {
+		c.applyGrab(false)
+	}
+	if emitToggle && c.opts.OnEvent != nil {
+		c.opts.OnEvent(Event{Kind: EventCaptureToggled, Grabbed: emitGrabState})
 	}
 }
 
@@ -517,7 +614,48 @@ func (c *linuxCapturer) emitLocked(ev Event) {
 	}
 }
 
+func (c *linuxCapturer) waitKeysReleased(ctx context.Context, maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		if !c.anyKeyboardKeyDown() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (c *linuxCapturer) anyKeyboardKeyDown() bool {
+	c.mu.Lock()
+	devs := slices.Clone(c.devices)
+	c.mu.Unlock()
+
+	var keyState [(keyMax/8 + 7) / 8]uint64
+	req := ioc(2, 'E', 0x18, uintptr(unsafe.Sizeof(keyState))) // EVIOCGKEY
+	for _, d := range devs {
+		if !d.isKB || d.file == nil {
+			continue
+		}
+		clear(keyState[:])
+		if ioctlBytes(d.file.Fd(), req, unsafe.Pointer(&keyState[0])) == nil {
+			for _, word := range keyState {
+				if word != 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (c *linuxCapturer) applyGrab(on bool) {
+	if c.grabFn != nil {
+		c.grabFn(on)
+		return
+	}
 	c.mu.Lock()
 	devs := slices.Clone(c.devices)
 	c.mu.Unlock()

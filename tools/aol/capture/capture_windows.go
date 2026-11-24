@@ -161,14 +161,17 @@ type winMsg struct {
 }
 
 type windowsCapturer struct {
-	opts      Options
-	mu        sync.Mutex
-	hwnd      uintptr
-	grabbed   bool
-	held      []uint16
-	mouseBtns uint8
-	lastPads  [4]protocol.GamepadState
-	xinputOk  bool
+	opts        Options
+	mu          sync.Mutex
+	hwnd        uintptr
+	grabbed     bool
+	pendingGrab bool
+	held        []uint16
+	mouseBtns   uint8
+	wheelXRem   int32
+	wheelYRem   int32
+	lastPads    [4]protocol.GamepadState
+	xinputOk    bool
 }
 
 // New creates a pure-Go Raw Input + XInput Capturer for Windows.
@@ -377,10 +380,16 @@ func (c *windowsCapturer) processWindowsMouse(rm *rawMouse) {
 	}
 	bf := rm.ButtonFlags
 	if bf&riMouseWheel != 0 {
-		wy = int16(rm.ButtonData)
+		c.wheelYRem += int32(int16(rm.ButtonData))
+		notches := c.wheelYRem / 120
+		c.wheelYRem -= notches * 120
+		wy = int16(notches)
 	}
 	if bf&riMouseHWheel != 0 {
-		wx = int16(rm.ButtonData)
+		c.wheelXRem += int32(int16(rm.ButtonData))
+		notches := c.wheelXRem / 120
+		c.wheelXRem -= notches * 120
+		wx = int16(notches)
 	}
 
 	var changed uint8
@@ -429,37 +438,52 @@ func (c *windowsCapturer) processWindowsKeyboard(rk *rawKeyboard) {
 		return
 	}
 	pressed := (rk.Flags & riKeyBreak) == 0
-	var toggle bool
+	var (
+		emitToggle    bool
+		emitGrabState bool
+		chordHit      bool
+	)
 
 	c.mu.Lock()
+	wasHeld := slices.Contains(c.held, hid)
 	if pressed {
-		if !slices.Contains(c.held, hid) {
+		if !wasHeld {
 			c.held = append(c.held, hid)
 		}
-		if hid == protocol.HIDKeyG &&
+		if !wasHeld && hid == protocol.HIDKeyG &&
 			(slices.Contains(c.held, protocol.HIDLeftCtrl) || slices.Contains(c.held, protocol.HIDRightCtrl)) &&
 			(slices.Contains(c.held, protocol.HIDLeftAlt) || slices.Contains(c.held, protocol.HIDRightAlt)) {
-			toggle = true
+			chordHit = true
+			if c.grabbed {
+				c.grabbed = false
+				c.mouseBtns = 0
+				c.pendingGrab = false
+				emitToggle = true
+				emitGrabState = false
+			} else if !c.pendingGrab {
+				c.pendingGrab = true
+			}
 		}
 	} else {
 		c.held = slices.DeleteFunc(c.held, func(u uint16) bool { return u == hid })
+		if len(c.held) == 0 && c.pendingGrab {
+			c.pendingGrab = false
+			c.grabbed = true
+			emitToggle = true
+			emitGrabState = true
+		}
 	}
 	active := c.grabbed
 	heldCopy := slices.Clone(c.held)
 	c.mu.Unlock()
 
-	if toggle && pressed {
-		c.mu.Lock()
-		c.grabbed = !c.grabbed
-		next := c.grabbed
-		if !next {
-			c.held = nil
-			c.mouseBtns = 0
-		}
-		c.mu.Unlock()
+	if emitToggle {
 		if c.opts.OnEvent != nil {
-			c.opts.OnEvent(Event{Kind: EventCaptureToggled, Grabbed: next})
+			c.opts.OnEvent(Event{Kind: EventCaptureToggled, Grabbed: emitGrabState})
 		}
+		return
+	}
+	if chordHit {
 		return
 	}
 
