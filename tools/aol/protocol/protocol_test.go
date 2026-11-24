@@ -16,14 +16,24 @@ func TestRoundTripPackets(t *testing.T) {
 	t.Parallel()
 
 	tag := protocol.AuthTag("4242")
+	var devID [8]byte
+	copy(devID[:], []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	var cid [8]byte
+	copy(cid[:], []byte{9, 8, 7, 6, 5, 4, 3, 2})
+	var key [32]byte
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	nonce := [8]byte{0xAA, 0xBB, 0xCC, 0xDD, 1, 2, 3, 4}
+
 	cases := []struct {
 		name string
 		seq  uint32
 		pkt  protocol.Packet
 	}{
 		{name: "discover", seq: 1, pkt: protocol.Discover{}},
-		{name: "announce", seq: 2, pkt: protocol.Announce{Port: 37419, Flags: 0x03, DeviceName: "iPhone 16 Pro"}},
-		{name: "hello", seq: 3, pkt: protocol.Hello{Flags: 1, DeviceMask: protocol.DeviceMaskWithPads(true, true, 2), AuthTag: tag, HostName: "archbox"}},
+		{name: "announce", seq: 2, pkt: protocol.Announce{Port: 37419, Flags: 0x03 | protocol.AnnounceFlagHasDeviceID, DeviceName: "iPhone 16 Pro", DeviceID: devID}},
+		{name: "hello", seq: 3, pkt: protocol.Hello{Flags: protocol.HelloFlagWantPair | protocol.HelloFlagHasClientID, DeviceMask: protocol.DeviceMaskWithPads(true, true, 2), AuthTag: tag, HostName: "archbox", ClientID: cid}},
 		{name: "hello_ack", seq: 4, pkt: protocol.HelloAck{Status: protocol.StatusOK, SessionActive: true, TVActive: true, DeviceName: "Madeira"}},
 		{name: "ping", seq: 5, pkt: protocol.Ping{TimestampUS: 123456789}},
 		{name: "pong", seq: 6, pkt: protocol.Pong{TimestampUS: 123456789}},
@@ -34,6 +44,8 @@ func TestRoundTripPackets(t *testing.T) {
 		{name: "release_all", seq: 11, pkt: protocol.ReleaseAll{Reason: 1}},
 		{name: "rumble", seq: 12, pkt: protocol.Rumble{Slot: 0, LeftMotor: 50000, RightMotor: 22000}},
 		{name: "disconnect", seq: 13, pkt: protocol.Disconnect{Reason: 0}},
+		{name: "state_sync", seq: 14, pkt: protocol.StateSync{Buttons: protocol.MouseButtonLeft, Held: []uint16{0x04, 0xE1}}},
+		{name: "pair_grant", seq: 15, pkt: protocol.PairGrant{DeviceID: devID, Nonce: nonce, MaskedKey: protocol.MaskPairKey("4242", nonce, key)}},
 	}
 
 	for _, tc := range cases {
@@ -103,6 +115,25 @@ func TestAuthTagAndKeymap(t *testing.T) {
 	}
 	if got := protocol.WindowsScancodeToHID(0x1D, true); got != protocol.HIDRightCtrl {
 		t.Fatalf("Win RCtrl = 0x%x, want 0x%x", got, protocol.HIDRightCtrl)
+	}
+
+	var key [32]byte
+	var cid [8]byte
+	for i := range key {
+		key[i] = byte(i + 7)
+	}
+	for i := range cid {
+		cid[i] = byte(i + 1)
+	}
+	k1 := protocol.PairedAuthTag(key, cid, 42)
+	k2 := protocol.PairedAuthTag(key, cid, 43)
+	if bytes.Equal(k1[:], k2[:]) {
+		t.Fatalf("PairedAuthTag must vary with seq")
+	}
+	nonce := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	masked := protocol.MaskPairKey("1234", nonce, key)
+	if unmasked := protocol.MaskPairKey("1234", nonce, masked); unmasked != key {
+		t.Fatalf("MaskPairKey roundtrip mismatch")
 	}
 }
 

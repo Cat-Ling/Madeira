@@ -21,21 +21,25 @@ const (
 )
 
 type cliConfig struct {
-	discover bool
-	target   string
-	port     int
-	pin      string
-	keyboard bool
-	mouse    bool
-	gamepad  bool
-	grab     bool
-	rumble   bool
-	jsonOut  bool
-	quiet    bool
-	verbose  bool
-	color    colorWhen
-	showHelp bool
-	showVer  bool
+	discover    bool
+	target      string
+	port        int
+	pin         string
+	keyFile     string
+	forcePair   bool
+	forget      bool
+	noReconnect bool
+	keyboard    bool
+	mouse       bool
+	gamepad     bool
+	grab        bool
+	rumble      bool
+	jsonOut     bool
+	quiet       bool
+	verbose     bool
+	color       colorWhen
+	showHelp    bool
+	showVer     bool
 }
 
 func defaultConfig() cliConfig {
@@ -128,6 +132,27 @@ func parseArgs(args []string) (cliConfig, error) {
 					return cfg, err
 				}
 				cfg.pin = v
+			case "key-file":
+				v, err := needVal()
+				if err != nil {
+					return cfg, err
+				}
+				cfg.keyFile = v
+			case "pair":
+				if err := noVal(); err != nil {
+					return cfg, err
+				}
+				cfg.forcePair = true
+			case "forget":
+				if err := noVal(); err != nil {
+					return cfg, err
+				}
+				cfg.forget = true
+			case "no-reconnect":
+				if err := noVal(); err != nil {
+					return cfg, err
+				}
+				cfg.noReconnect = true
 			case "no-keyboard":
 				if err := noVal(); err != nil {
 					return cfg, err

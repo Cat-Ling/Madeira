@@ -47,6 +47,32 @@ const (
 	StatusOK       uint8 = 0
 	StatusBadPIN   uint8 = 1
 	StatusDisabled uint8 = 2
+	StatusUnpaired uint8 = 3
+)
+
+// Hello capability/pairing flags.
+const (
+	HelloFlagWantPair    uint8 = 1 << 0
+	HelloFlagPairedKey   uint8 = 1 << 1
+	HelloFlagHasClientID uint8 = 1 << 2
+)
+
+// Announce flags.
+const (
+	AnnounceFlagRequirePIN  uint8 = 1 << 0
+	AnnounceFlagSession     uint8 = 1 << 1
+	AnnounceFlagHasDeviceID uint8 = 1 << 2
+)
+
+// Disconnect reason codes.
+const (
+	ReasonNormal      uint8 = 0
+	ReasonUser        uint8 = 1
+	ReasonDisabled    uint8 = 2
+	ReasonRestart     uint8 = 3
+	ReasonSuperseded  uint8 = 4
+	ReasonTimeout     uint8 = 5
+	ReasonRehandshake uint8 = 6
 )
 
 // PacketType identifies a MAOL v1 packet payload.
@@ -61,12 +87,14 @@ const (
 	TypeMouseButton  PacketType = 0x05
 	TypeGamepadState PacketType = 0x06
 	TypeReleaseAll   PacketType = 0x07
+	TypeStateSync    PacketType = 0x08
 
 	TypeAnnounce   PacketType = 0x80
 	TypeHelloAck   PacketType = 0x81
 	TypePong       PacketType = 0x82
 	TypeRumble     PacketType = 0x83
 	TypeDisconnect PacketType = 0x84
+	TypePairGrant  PacketType = 0x85
 )
 
 // Sentinel errors returned when decoding malformed packets.
@@ -102,13 +130,22 @@ type Announce struct {
 	Port       uint16
 	Flags      uint8
 	DeviceName string
+	DeviceID   [8]byte
 }
 
 func (Announce) PacketType() PacketType { return TypeAnnounce }
 func (p Announce) appendBody(dst []byte) []byte {
 	dst = binary.LittleEndian.AppendUint16(dst, p.Port)
-	dst = append(dst, p.Flags)
-	return appendShortString(dst, p.DeviceName)
+	flags := p.Flags
+	if p.DeviceID != ([8]byte{}) {
+		flags |= AnnounceFlagHasDeviceID
+	}
+	dst = append(dst, flags)
+	dst = appendShortString(dst, p.DeviceName)
+	if (flags & AnnounceFlagHasDeviceID) != 0 {
+		dst = append(dst, p.DeviceID[:]...)
+	}
+	return dst
 }
 
 // Hello initiates a session from the PC client to Madeira.
@@ -117,13 +154,22 @@ type Hello struct {
 	DeviceMask uint8
 	AuthTag    [8]byte
 	HostName   string
+	ClientID   [8]byte
 }
 
 func (Hello) PacketType() PacketType { return TypeHello }
 func (p Hello) appendBody(dst []byte) []byte {
-	dst = append(dst, p.Flags, p.DeviceMask)
+	flags := p.Flags
+	if p.ClientID != ([8]byte{}) {
+		flags |= HelloFlagHasClientID
+	}
+	dst = append(dst, flags, p.DeviceMask)
 	dst = append(dst, p.AuthTag[:]...)
-	return appendShortString(dst, p.HostName)
+	dst = appendShortString(dst, p.HostName)
+	if (flags & HelloFlagHasClientID) != 0 {
+		dst = append(dst, p.ClientID[:]...)
+	}
+	return dst
 }
 
 // DeviceMaskWithPads encodes keyboard, mouse, and gamepad slot count (0-15) into DeviceMask.
@@ -279,6 +325,41 @@ type Disconnect struct {
 func (Disconnect) PacketType() PacketType         { return TypeDisconnect }
 func (p Disconnect) appendBody(dst []byte) []byte { return append(dst, p.Reason) }
 
+// StateSync carries an idempotent snapshot of held mouse buttons and HID keys
+// so UDP packet loss cannot leave keys or mouse buttons stuck down.
+type StateSync struct {
+	Buttons uint8
+	Held    []uint16
+}
+
+func (StateSync) PacketType() PacketType { return TypeStateSync }
+func (p StateSync) appendBody(dst []byte) []byte {
+	held := p.Held
+	if len(held) > MaxHeldKeys {
+		held = held[:MaxHeldKeys]
+	}
+	dst = append(dst, p.Buttons, uint8(len(held)))
+	for _, u := range held {
+		dst = binary.LittleEndian.AppendUint16(dst, u)
+	}
+	return dst
+}
+
+// PairGrant issues a persistent 32-byte pairing key from Madeira to a PC client,
+// masked with the pairing PIN and per-grant nonce.
+type PairGrant struct {
+	DeviceID  [8]byte
+	Nonce     [8]byte
+	MaskedKey [32]byte
+}
+
+func (PairGrant) PacketType() PacketType { return TypePairGrant }
+func (p PairGrant) appendBody(dst []byte) []byte {
+	dst = append(dst, p.DeviceID[:]...)
+	dst = append(dst, p.Nonce[:]...)
+	return append(dst, p.MaskedKey[:]...)
+}
+
 // AuthTag derives the 8-byte PIN authentication tag for Hello packets.
 // When pin is empty, an all-zero tag is returned.
 func AuthTag(pin string) [8]byte {
@@ -288,6 +369,34 @@ func AuthTag(pin string) [8]byte {
 	}
 	sum := sha256.Sum256([]byte("MAOL-v1:" + pin))
 	copy(out[:], sum[:8])
+	return out
+}
+
+// PairedAuthTag derives an 8-byte HMAC-like authentication tag using a persistent
+// 32-byte pairing key, client ID, and the Hello packet sequence number.
+func PairedAuthTag(key [32]byte, clientID [8]byte, seq uint32) [8]byte {
+	var msg [12 + 32 + 8 + 4]byte
+	copy(msg[:12], "MAOL-v1-key:")
+	copy(msg[12:44], key[:])
+	copy(msg[44:52], clientID[:])
+	binary.LittleEndian.PutUint32(msg[52:56], seq)
+	sum := sha256.Sum256(msg[:])
+	var out [8]byte
+	copy(out[:], sum[:8])
+	return out
+}
+
+// MaskPairKey XOR-masks (or unmasks) a 32-byte pairing key using SHA256("MAOL-v1-mask:" || pin || nonce).
+func MaskPairKey(pin string, nonce [8]byte, key [32]byte) [32]byte {
+	msg := make([]byte, 0, 13+len(pin)+8)
+	msg = append(msg, "MAOL-v1-mask:"...)
+	msg = append(msg, pin...)
+	msg = append(msg, nonce[:]...)
+	mask := sha256.Sum256(msg)
+	var out [32]byte
+	for i := range out {
+		out[i] = key[i] ^ mask[i]
+	}
 	return out
 }
 
@@ -329,30 +438,50 @@ func Unmarshal(data []byte) (Header, Packet, error) {
 		if len(body) < 4 {
 			return hdr, nil, ErrTruncated
 		}
-		name, err := readShortString(body[3:])
+		flags := body[2]
+		name, consumed, err := readShortStringRest(body[3:])
 		if err != nil {
 			return hdr, nil, err
 		}
+		var devID [8]byte
+		if (flags & AnnounceFlagHasDeviceID) != 0 {
+			rest := body[3+consumed:]
+			if len(rest) < 8 {
+				return hdr, nil, ErrTruncated
+			}
+			copy(devID[:], rest[:8])
+		}
 		return hdr, Announce{
 			Port:       binary.LittleEndian.Uint16(body[0:2]),
-			Flags:      body[2],
+			Flags:      flags,
 			DeviceName: name,
+			DeviceID:   devID,
 		}, nil
 	case TypeHello:
 		if len(body) < 11 {
 			return hdr, nil, ErrTruncated
 		}
+		flags := body[0]
 		var tag [8]byte
 		copy(tag[:], body[2:10])
-		name, err := readShortString(body[10:])
+		name, consumed, err := readShortStringRest(body[10:])
 		if err != nil {
 			return hdr, nil, err
 		}
+		var cid [8]byte
+		if (flags & HelloFlagHasClientID) != 0 {
+			rest := body[10+consumed:]
+			if len(rest) < 8 {
+				return hdr, nil, ErrTruncated
+			}
+			copy(cid[:], rest[:8])
+		}
 		return hdr, Hello{
-			Flags:      body[0],
+			Flags:      flags,
 			DeviceMask: body[1],
 			AuthTag:    tag,
 			HostName:   name,
+			ClientID:   cid,
 		}, nil
 	case TypeHelloAck:
 		if len(body) < 4 {
@@ -447,6 +576,33 @@ func Unmarshal(data []byte) (Header, Packet, error) {
 			return hdr, nil, ErrTruncated
 		}
 		return hdr, Disconnect{Reason: body[0]}, nil
+	case TypeStateSync:
+		if len(body) < 2 {
+			return hdr, nil, ErrTruncated
+		}
+		buttons := body[0]
+		count := int(body[1])
+		if count > MaxHeldKeys {
+			count = MaxHeldKeys
+		}
+		if len(body) < 2+count*2 {
+			return hdr, nil, ErrTruncated
+		}
+		held := make([]uint16, count)
+		for i := range count {
+			off := 2 + i*2
+			held[i] = binary.LittleEndian.Uint16(body[off : off+2])
+		}
+		return hdr, StateSync{Buttons: buttons, Held: held}, nil
+	case TypePairGrant:
+		if len(body) < 48 {
+			return hdr, nil, ErrTruncated
+		}
+		var p PairGrant
+		copy(p.DeviceID[:], body[0:8])
+		copy(p.Nonce[:], body[8:16])
+		copy(p.MaskedKey[:], body[16:48])
+		return hdr, p, nil
 	default:
 		return hdr, nil, fmt.Errorf("%w: 0x%02x", ErrUnknownType, uint8(hdr.Type))
 	}
@@ -461,15 +617,20 @@ func appendShortString(dst []byte, s string) []byte {
 	return append(dst, b...)
 }
 
-func readShortString(b []byte) (string, error) {
+func readShortStringRest(b []byte) (string, int, error) {
 	if len(b) < 1 {
-		return "", ErrTruncated
+		return "", 0, ErrTruncated
 	}
 	n := int(b[0])
 	if len(b) < 1+n {
-		return "", ErrTruncated
+		return "", 0, ErrTruncated
 	}
-	return string(b[1 : 1+n]), nil
+	return string(b[1 : 1+n]), 1 + n, nil
+}
+
+func readShortString(b []byte) (string, error) {
+	s, _, err := readShortStringRest(b)
+	return s, err
 }
 
 func boolByte(v bool) uint8 {

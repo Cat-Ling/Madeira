@@ -5,6 +5,7 @@ package client
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sort"
@@ -19,6 +20,7 @@ type Peer struct {
 	Port       uint16 `json:"port"`
 	Flags      uint8  `json:"flags"`
 	DeviceName string `json:"deviceName"`
+	DeviceID   string `json:"deviceId,omitempty"`
 }
 
 // Discover broadcasts a MAOL discovery packet on port and collects unique
@@ -81,11 +83,16 @@ func Discover(ctx context.Context, port int, timeout time.Duration) ([]Peer, err
 			peerPort = uint16(port)
 		}
 		addr := net.JoinHostPort(udpAddr.IP.String(), fmt.Sprintf("%d", peerPort))
+		var devID string
+		if ann.DeviceID != ([8]byte{}) {
+			devID = hex.EncodeToString(ann.DeviceID[:])
+		}
 		seen[addr] = Peer{
 			Addr:       addr,
 			Port:       peerPort,
 			Flags:      ann.Flags,
 			DeviceName: ann.DeviceName,
+			DeviceID:   devID,
 		}
 	}
 

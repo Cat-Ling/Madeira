@@ -1,79 +1,80 @@
 .\" SPDX-FileCopyrightText: 2026 Cat-Ling
 .\" SPDX-License-Identifier: GPL-3.0-or-later
-.TH MADEIRA-AOL 1 "November 2026" "madeira-aol 1.0.0" "User Commands"
+.TH MADEIRA-AOL 1 "2026-11-24" "madeira-aol 1.1.0" "User Commands"
 .SH NAME
 madeira-aol \- forward PC keyboard, mouse, and gamepad input over LAN to Madeira
 .SH SYNOPSIS
 .B madeira-aol
-[\fIOPTION\fR]...
+[\fIOPTION\fR]... [\fIHOST\fR[\fI:PORT\fR]]
 .SH DESCRIPTION
 .B madeira-aol
-captures local keyboard, relative mouse, and game controller events on a desktop
-computer and streams them over UDP to Madeira running Accessories Over LAN (AoL)
-on iOS or iPadOS. Controller vibration feedback sent by Madeira is forwarded back
-to connected PC controllers.
-.PP
-While capture is active on Linux or Windows, pressing
-.B Ctrl+Alt+G
-toggles exclusive keyboard and mouse grab.
+captures local raw keyboard, mouse, and gamepad events on Linux or Windows
+and streams them with low latency over UDP (\fBMAOL\fR v1) to Madeira running
+on iOS or iPadOS, while applying XInput controller vibration (rumble) feedback
+returned from Madeira. It automatically reconnects across game switches and
+app restarts and persists pairing keys locally so regenerated PINs do not
+interrupt reconnection.
 .SH OPTIONS
 .TP
 .BR \-d ", " \-\-discover
-Broadcast a discovery probe on the LAN, print responding Madeira devices, and exit.
+Probe the local network for Madeira instances and exit.
 .TP
-.BR \-t ", " \-\-target =\fIHOST[:PORT]\fR
-Connect to Madeira at \fIHOST\fR (default port 37419 if omitted).
+.BR \-t ", " \-\-target =\fIADDR\fR
+Connect directly to \fIHOST[:PORT]\fR instead of auto-discovering.
 .TP
 .BR \-p ", " \-\-port =\fIPORT\fR
-UDP port used for discovery or default target connections (default 37419).
+UDP port used for discovery and default target port (default: 37419).
 .TP
 .BR \-\-pin =\fIPIN\fR
-Four-digit or passphrase PIN matching Madeira's AoL settings.
+Pairing PIN configured in Madeira's Accessories Over LAN settings.
 .TP
-.B \-\-no\-keyboard
-Do not forward keyboard events.
+.BR \-\-pair
+Force fresh PIN pairing and overwrite any saved key for the target.
 .TP
-.B \-\-no\-mouse
-Do not forward mouse motion, buttons, or wheel events.
+.BR \-\-forget
+Remove the saved pairing key matching the target host or device ID and exit.
 .TP
-.B \-\-no\-gamepad
-Do not forward gamepad input or rumble.
+.BR \-\-key\-file =\fIPATH\fR
+Override the paired keys JSON path (defaults to user config directory).
 .TP
-.B \-\-no\-grab
-Read input devices without taking an exclusive desktop grab.
+.BR \-\-no\-reconnect
+Exit when the remote session disconnects instead of auto-reconnecting.
 .TP
-.B \-\-no\-rumble
-Ignore incoming rumble packets from Madeira.
+.BR \-\-no\-keyboard ", " \-\-no\-mouse ", " \-\-no\-gamepad
+Disable forwarding for the corresponding input class.
+.TP
+.BR \-\-no\-grab
+Do not exclusively grab keyboard and mouse devices on Linux.
+.TP
+.BR \-\-no\-rumble
+Ignore rumble feedback packets sent by Madeira.
 .TP
 .B \-\-json
-Emit discovery results as JSON to standard output.
+Emit discovery results as JSON.
 .TP
-.BR \-\-color =\fIWHEN\fR
-Colorize diagnostics: \fBauto\fR, \fBalways\fR, or \fBnever\fR.
-.TP
-.B \-\-no\-color
-Disable colored diagnostics.
+.BR \-\-color =\fIWHEN\fR ", " \-\-no\-color
+Control diagnostic color output (\fIauto\fR, \fIalways\fR, \fInever\fR).
 .TP
 .BR \-q ", " \-\-quiet
-Suppress informational diagnostics.
+Suppress informational messages.
 .TP
 .BR \-v ", " \-\-verbose
-Print detailed connection, packet, and device diagnostics to standard error.
+Enable verbose transport diagnostics.
 .TP
 .BR \-h ", " \-\-help
-Display usage information and exit.
+Display help and exit.
 .TP
 .BR \-V ", " \-\-version
-Display version and license information and exit.
+Display version and exit.
+.SH INTERACTIVE CONTROLS
+Press \fBCtrl+Alt+G\fR while streaming to toggle exclusive input capture.
 .SH EXIT STATUS
 .TP
 .B 0
-Success.
+Clean exit.
 .TP
 .B 1
-Network, device, authentication, or runtime failure.
+Runtime, discovery, authentication, or connection error.
 .TP
 .B 2
 Invalid command-line usage.
-.SH LICENSE
-License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.

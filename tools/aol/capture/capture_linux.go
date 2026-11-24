@@ -139,6 +139,8 @@ type linuxCapturer struct {
 	mu            sync.Mutex
 	devices       []*linuxDevice
 	grabbed       bool
+	desiredGrab   bool
+	connected     bool
 	pendingGrab   bool
 	pendingUngrab bool
 	held          []uint16
@@ -153,9 +155,11 @@ type linuxCapturer struct {
 // New creates a platform input Capturer for Linux evdev devices.
 func New(opts Options) (Capturer, error) {
 	c := &linuxCapturer{
-		opts:    opts,
-		grabbed: opts.Grab,
-		heldEv:  make(map[evdevKey]struct{}),
+		opts:        opts,
+		grabbed:     opts.Grab,
+		desiredGrab: opts.Grab,
+		connected:   true,
+		heldEv:      make(map[evdevKey]struct{}),
 	}
 	if err := c.openDevices(); err != nil {
 		return nil, err
@@ -171,6 +175,32 @@ func (c *linuxCapturer) Summary() Summary {
 		Mice:      c.mice,
 		Gamepads:  c.gamepads,
 		Grabbed:   c.grabbed,
+	}
+}
+
+func (c *linuxCapturer) SetConnected(connected bool) {
+	c.mu.Lock()
+	prev := c.connected
+	c.connected = connected
+	if !connected {
+		c.grabbed = false
+		c.pendingGrab = false
+		c.pendingUngrab = false
+		c.held = nil
+		c.mouseBtns = 0
+		c.mu.Unlock()
+		c.applyGrab(false)
+		return
+	}
+	wantGrab := !prev && c.desiredGrab && c.opts.Grab
+	c.grabbed = wantGrab
+	c.held = nil
+	c.mouseBtns = 0
+	c.mu.Unlock()
+
+	if wantGrab {
+		c.waitKeysReleased(context.Background(), 500*time.Millisecond)
+		c.applyGrab(true)
 	}
 }
 
@@ -469,6 +499,7 @@ func (c *linuxCapturer) processDeviceBatch(d *linuxDevice, events []RawInputEven
 								// chord keys are released so repeats/releases do not leak
 								// to the host terminal.
 								c.grabbed = false
+								c.desiredGrab = false
 								c.mouseBtns = 0
 								if c.opts.Grab {
 									c.pendingUngrab = true
@@ -476,11 +507,12 @@ func (c *linuxCapturer) processDeviceBatch(d *linuxDevice, events []RawInputEven
 								c.pendingGrab = false
 								emitToggle = true
 								emitGrabState = false
-							} else if !c.pendingGrab && !c.pendingUngrab {
+							} else if c.connected && !c.pendingGrab && !c.pendingUngrab {
 								// Defer EVIOCGRAB until the user releases all chord keys
 								// so the host OS receives every key-up and never gets
 								// stuck repeating Ctrl+Alt+G.
 								c.pendingGrab = true
+								c.desiredGrab = true
 							}
 						}
 					} else {

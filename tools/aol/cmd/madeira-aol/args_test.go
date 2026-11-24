@@ -35,4 +35,22 @@ func TestParseArgs(t *testing.T) {
 			t.Fatalf("expected invalid port error")
 		}
 	})
+
+	t.Run("pairing_and_reconnect_flags", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := parseArgs([]string{"--pair", "--no-reconnect", "--key-file=/tmp/keys.json", "192.168.1.10"})
+		if err != nil {
+			t.Fatalf("parseArgs error: %v", err)
+		}
+		if !cfg.forcePair || !cfg.noReconnect || cfg.keyFile != "/tmp/keys.json" || cfg.target != "192.168.1.10" {
+			t.Fatalf("unexpected cfg: %+v", cfg)
+		}
+		cfg2, err := parseArgs([]string{"--forget", "192.168.1.10"})
+		if err != nil {
+			t.Fatalf("parseArgs error: %v", err)
+		}
+		if !cfg2.forget || cfg2.target != "192.168.1.10" {
+			t.Fatalf("unexpected cfg2: %+v", cfg2)
+		}
+	})
 }

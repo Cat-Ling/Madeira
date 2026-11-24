@@ -29,8 +29,10 @@ func TestLinuxGrabDeferUntilChordReleased(t *testing.T) {
 				}
 			},
 		},
-		grabbed: true,
-		heldEv:  make(map[evdevKey]struct{}),
+		grabbed:     true,
+		desiredGrab: true,
+		connected:   true,
+		heldEv:      make(map[evdevKey]struct{}),
 		grabFn: func(on bool) {
 			grabs = append(grabs, on)
 		},

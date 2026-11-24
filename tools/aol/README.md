@@ -1,30 +1,42 @@
-# madeira-aol — Accessories Over LAN (AoL)
+# Madeira Accessories Over LAN (`madeira-aol`)
 
-`madeira-aol` is a cross-platform pure-Go library and CLI utility that captures raw
-keyboard, mouse, and XInput-compatible gamepad input from a PC (Linux `evdev` or
-Windows Raw Input + XInput) and forwards it over LAN UDP (`MAOL` v1) to Madeira
-on iOS/iPadOS with minimal latency, while forwarding controller rumble back to the PC.
+Pure-Go (`CGO_ENABLED=0`, zero external dependencies) PC host capture daemon,
+reusable Go library, and CLI for streaming raw keyboard, mouse, and XInput
+gamepad events over LAN UDP (`MAOL` v1, port `37419`) into Madeira on iOS,
+while forwarding XInput rumble feedback back to the PC.
 
-## Layout
+## Quick Build
 
-- `protocol/` — Binary `MAOL` v1 wire framing, PIN authentication tag, and Linux/Windows HID keymaps.
-- `client/` — Reusable UDP client library (`Discover`, `Dial`, key/mouse/gamepad senders, ping RTT, rumble callback).
-- `capture/` — Platform input capture (`evdev` on Linux, Raw Input + XInput on Windows).
-- `cmd/madeira-aol/` — CLI server binary.
-
-## Build & Check
-
-```sh
+```bash
 CGO_ENABLED=0 go build ./cmd/madeira-aol
-go test -race ./...
 ```
 
-## Quick Usage
+Cross-compile for Windows:
 
-```sh
-# Discover Madeira instances on the LAN
-madeira-aol --discover
-
-# Connect directly and capture input (press Ctrl+Alt+G on the PC to toggle grab)
-madeira-aol --target 192.168.1.42:37419 --pin 1234
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./cmd/madeira-aol
 ```
+
+## Usage
+
+```bash
+# Discover Madeira instances on the local network:
+./madeira-aol --discover
+
+# Initial pairing using the PIN shown in Madeira -> Settings -> Accessories Over LAN:
+./madeira-aol --target <IPHONE_IP>:37419 --pin <PIN>
+
+# Subsequent runs automatically use the saved pairing key (even if PIN changes)
+# and auto-reconnect across game switches and app restarts:
+./madeira-aol
+```
+
+Press **Ctrl+Alt+G** while streaming to toggle exclusive input grab on Linux
+and release/re-capture all keys on Windows.
+
+## Packages
+
+- `github.com/Cat-Ling/Madeira/tools/aol/protocol`: wire framing, SHA-256 PIN/paired-key auth, keymaps
+- `github.com/Cat-Ling/Madeira/tools/aol/client`: UDP discovery, DSCP EF QoS, 250 Hz mouse coalescing, redundant StateSync, keystore, and rumble callbacks
+- `github.com/Cat-Ling/Madeira/tools/aol/capture`: Linux `evdev` + Windows Raw Input / XInput backends
+- `github.com/Cat-Ling/Madeira/tools/aol/cmd/madeira-aol`: POSIX/GNU CLI with auto-reconnect supervisor

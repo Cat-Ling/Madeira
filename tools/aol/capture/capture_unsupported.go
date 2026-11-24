@@ -17,4 +17,5 @@ func New(Options) (Capturer, error) {
 
 func (unsupportedCapturer) Run(context.Context) error             { return ErrUnsupportedPlatform }
 func (unsupportedCapturer) SetRumble(uint8, uint16, uint16) error { return ErrUnsupportedPlatform }
+func (unsupportedCapturer) SetConnected(bool)                     {}
 func (unsupportedCapturer) Summary() Summary                      { return Summary{} }

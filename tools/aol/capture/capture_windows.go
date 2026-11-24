@@ -218,6 +218,15 @@ func (c *windowsCapturer) SetRumble(slot uint8, left, right uint16) error {
 	return nil
 }
 
+func (c *windowsCapturer) SetConnected(connected bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !connected {
+		c.held = nil
+		c.mouseBtns = 0
+	}
+}
+
 func (c *windowsCapturer) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)

@@ -57,6 +57,7 @@ type Summary struct {
 type Capturer interface {
 	Run(ctx context.Context) error
 	SetRumble(slot uint8, left, right uint16) error
+	SetConnected(connected bool)
 	Summary() Summary
 }
 

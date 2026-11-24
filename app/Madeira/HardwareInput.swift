@@ -806,6 +806,7 @@ final class HardwareInput: ObservableObject {
     private var pressGen: [MouseButton: Int] = [:]
     private var gcButtonSeen = false
     private var buttonRouteTraceCount = 0
+    private let remoteLock = NSLock()
     private var remoteKeysPosted = HeldEdges<Int32>()
     private var remoteButtonsPosted = HeldEdges<MouseButton>()
     private var remoteConsoleButtons = HeldEdges<MouseButton>()
@@ -852,6 +853,8 @@ final class HardwareInput: ObservableObject {
     private var route: PointerRoute = .relative
     private var mouseInUseMirror = false
     private var consoleInputActive = false
+    private var remoteFocusReady = false
+    private var remoteTVGameplay = false
     /// A GCMouse delta inside this many seconds means the hand is on the mouse
     /// and a `.direct` touch is AssistiveTouch's, not a finger's.
     private static let mouseActiveWindow: CFTimeInterval = 2.0
@@ -873,6 +876,7 @@ final class HardwareInput: ObservableObject {
     // MARK: bookkeeping (main thread)
 
     private var started = false
+    private var remoteClientConnected = false
     /// GameController hands the same GCMouse back from `mice()`, `current` and
     /// the notifications; the identity set decides what is news.
     private var attachedMice = Set<ObjectIdentifier>()
@@ -1031,8 +1035,14 @@ final class HardwareInput: ObservableObject {
     // MARK: - focus
 
     func syncConsoleRouting(isActive: Bool, consoleOwnsInput: Bool) {
+        let base = computeBaseFocus()
+        let typing = typingElsewhere()
+        let console = isActive && consoleOwnsInput
+        let tvGame = MainActor.assumeIsolated { ExternalDisplay.shared.isGameplayOnExternal }
         motionLock.lock()
-        consoleInputActive = isActive && consoleOwnsInput
+        consoleInputActive = console
+        remoteTVGameplay = tvGame
+        remoteFocusReady = Self.enabled && base && !console && !typing
         motionLock.unlock()
         refreshFocus("external-console")
     }
@@ -1055,13 +1065,20 @@ final class HardwareInput: ObservableObject {
     private func evaluateFocus(_ why: String) {
         installTouchObserver()
         let base = computeBaseFocus()
+        let typing = typingElsewhere()
         let (extOwnsConsole, tvGameplay) = MainActor.assumeIsolated {
             (ExternalDisplay.shared.consoleOwnsInput, ExternalDisplay.shared.isGameplayOnExternal)
         }
+        let remoteReady = Self.enabled && base && !extOwnsConsole && !typing
         motionLock.lock()
         consoleInputActive = extOwnsConsole
+        remoteTVGameplay = tvGameplay
+        remoteFocusReady = remoteReady
         motionLock.unlock()
-        let keyboard = base && !extOwnsConsole && !typingElsewhere() && !libraryTypingOwnsKeys
+        if !remoteReady {
+            releaseAllRemoteInputFast()
+        }
+        let keyboard = base && !extOwnsConsole && !typing && !libraryTypingOwnsKeys
         // iPhone: the AssistiveTouch pointer's hover ends whenever it stops
         // against a screen edge, while GCMouse deltas keep coming; following
         // hover there dropped mouse-look at every edge. Clicks decide instead.
@@ -1122,7 +1139,7 @@ final class HardwareInput: ObservableObject {
     /// Four times a second while a keyboard, mouse or controller is attached:
     /// a sheet or text field can take focus without any event reaching here.
     private func updateFocusTimer() {
-        let want = Self.enabled && (keyboardConnected || mouseConnected || PadStickMouse.shared.controllerConnected)
+        let want = Self.enabled && (keyboardConnected || mouseConnected || PadStickMouse.shared.controllerConnected || remoteClientConnected)
         if want, focusTimer == nil {
             let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.refreshFocus("poll") }
             RunLoop.main.add(t, forMode: .common)
@@ -2050,96 +2067,189 @@ final class HardwareInput: ObservableObject {
 
     // MARK: - Accessories Over LAN (AoL) injection
 
-    @MainActor
-    func injectRemoteKey(hidUsage: UInt16, pressed: Bool, heldUsages: Set<UInt16>) {
-        tickKeys += 1
+    /// Fast lock-protected remote key injection safe to invoke directly from AoL's
+    /// `.userInteractive` UDP receive queue without hoping onto MainActor during gameplay.
+    func injectRemoteKeyFast(hidUsage: UInt16, pressed: Bool, heldUsages: Set<UInt16>) {
         let vk = HardwareKeyMap.vk(forHIDUsage: Int(hidUsage))
-        if pressed, ExternalDisplay.shared.isGameplayOnExternal, vk == 0x79 {
-            ExternalConsoleController.shared.lastInputKind = .remoteLAN
-            _ = ExternalConsoleController.shared.handleKey(vk: 0x79)
-            releaseRemoteKeys()
-            return
-        }
-        if ExternalDisplay.shared.consoleOwnsInput {
-            releaseRemoteKeys()
-            if pressed, let vk {
-                ExternalConsoleController.shared.lastInputKind = .remoteLAN
-                _ = ExternalConsoleController.shared.handleKey(vk: vk)
+        motionLock.lock()
+        let console = consoleInputActive
+        let tvGameplay = remoteTVGameplay
+        let focusReady = remoteFocusReady
+        motionLock.unlock()
+
+        if pressed, tvGameplay, vk == 0x79 {
+            releaseRemoteKeysFast()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    ExternalConsoleController.shared.lastInputKind = .remoteLAN
+                    _ = ExternalConsoleController.shared.handleKey(vk: 0x79)
+                }
             }
             return
         }
-        refreshFocus("remote AoL key")
-        guard Self.enabled, computeBaseFocus(), !typingElsewhere() else {
-            releaseRemoteKeys()
+        if console {
+            releaseRemoteKeysFast()
+            if pressed, let vk {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        ExternalConsoleController.shared.lastInputKind = .remoteLAN
+                        _ = ExternalConsoleController.shared.handleKey(vk: vk)
+                    }
+                }
+            }
+            return
+        }
+        guard focusReady else {
+            releaseRemoteKeysFast()
             return
         }
         var wantVks = Set(heldUsages.compactMap { HardwareKeyMap.vk(forHIDUsage: Int($0)) })
         if pressed, let vk { wantVks.insert(vk) }
+        remoteLock.lock()
         let edges = remoteKeysPosted.update(wantVks)
+        remoteLock.unlock()
         for released in edges.up { winios_post_key(released, 0) }
         for pressedKey in edges.down { winios_post_key(pressedKey, 1) }
-        startTicker()
+        bumpTicker()
+    }
+
+    /// Fast lock-protected remote pointer, wheel, and button injection callable directly
+    /// from AoL's UDP queue.
+    func injectRemoteMouseFast(dx: Int32, dy: Int32, wheelX: Int32, wheelY: Int32,
+                               buttonMask: UInt8, updateButtons: Bool) {
+        motionLock.lock()
+        let console = consoleInputActive
+        let focusReady = remoteFocusReady
+        let needMouseWake = !mouseInUseMirror
+        motionLock.unlock()
+
+        if console {
+            releaseRemoteMouseButtonsFast()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    ExternalConsoleController.shared.lastInputKind = .remoteLAN
+                    if dx != 0 || dy != 0 {
+                        ExternalConsoleController.shared.moveCursor(dx: Double(dx), dy: Double(dy))
+                    }
+                    if wheelX != 0 || wheelY != 0 {
+                        ExternalConsoleController.shared.handleMouseScroll(dx: Double(wheelX), dy: Double(wheelY))
+                    }
+                    if updateButtons, let self {
+                        let consoleEdges = self.remoteConsoleButtons.update(AOLMouseButtonMask.buttons(from: buttonMask))
+                        for b in consoleEdges.up { ExternalConsoleController.shared.handleMouseButton(b, pressed: false) }
+                        for b in consoleEdges.down { ExternalConsoleController.shared.handleMouseButton(b, pressed: true) }
+                    }
+                }
+            }
+            return
+        }
+        guard focusReady else {
+            if updateButtons { releaseRemoteMouseButtonsFast() }
+            return
+        }
+        if dx != 0 || dy != 0 {
+            if needMouseWake {
+                DispatchQueue.main.async { [weak self] in self?.setMouseInUse(true) }
+            }
+            postMotion(Double(dx), Double(dy))
+        }
+        if wheelX != 0 || wheelY != 0 {
+            motionLock.lock()
+            let notches = wheel.add(Double(wheelX), Double(wheelY))
+            tickWheel += notches.count
+            motionLock.unlock()
+            for n in notches { winios_pointer(0, 0, n.flags, UInt32(bitPattern: n.delta)) }
+            if !notches.isEmpty { bumpTicker() }
+        }
+        if updateButtons {
+            let wantButtons = AOLMouseButtonMask.buttons(from: buttonMask)
+            if !wantButtons.isEmpty && needMouseWake {
+                DispatchQueue.main.async { [weak self] in self?.setMouseInUse(true) }
+            }
+            remoteLock.lock()
+            let edges = remoteButtonsPosted.update(wantButtons)
+            remoteLock.unlock()
+            for b in edges.up { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
+            for b in edges.down { let e = b.event(down: true); winios_pointer(0, 0, e.flags, e.data) }
+        }
+        bumpTicker()
+    }
+
+    /// Reconciles full remote keyboard + mouse button state from redundant StateSync frames.
+    func injectRemoteStateSyncFast(buttonMask: UInt8, heldUsages: Set<UInt16>) {
+        motionLock.lock()
+        let console = consoleInputActive
+        let focusReady = remoteFocusReady
+        motionLock.unlock()
+
+        if console || !focusReady {
+            releaseAllRemoteInputFast()
+            return
+        }
+        let wantVks = Set(heldUsages.compactMap { HardwareKeyMap.vk(forHIDUsage: Int($0)) })
+        let wantButtons = AOLMouseButtonMask.buttons(from: buttonMask)
+        remoteLock.lock()
+        let keyEdges = remoteKeysPosted.update(wantVks)
+        let btnEdges = remoteButtonsPosted.update(wantButtons)
+        remoteLock.unlock()
+        for vk in keyEdges.up { winios_post_key(vk, 0) }
+        for vk in keyEdges.down { winios_post_key(vk, 1) }
+        for b in btnEdges.up { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
+        for b in btnEdges.down { let e = b.event(down: true); winios_pointer(0, 0, e.flags, e.data) }
+    }
+
+    /// Thread-safe release of all held remote keyboard and mouse inputs.
+    func releaseAllRemoteInputFast() {
+        releaseRemoteKeysFast()
+        releaseRemoteMouseButtonsFast()
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { _ = remoteConsoleButtons.update([]) }
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    _ = self.remoteConsoleButtons.update([])
+                }
+            }
+        }
+    }
+
+    private func releaseRemoteKeysFast() {
+        remoteLock.lock()
+        let ups = remoteKeysPosted.update([]).up
+        remoteLock.unlock()
+        for vk in ups { winios_post_key(vk, 0) }
+    }
+
+    private func releaseRemoteMouseButtonsFast() {
+        remoteLock.lock()
+        let ups = remoteButtonsPosted.update([]).up
+        remoteLock.unlock()
+        for b in ups { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
+    }
+
+    @MainActor
+    func injectRemoteKey(hidUsage: UInt16, pressed: Bool, heldUsages: Set<UInt16>) {
+        tickKeys += 1
+        injectRemoteKeyFast(hidUsage: hidUsage, pressed: pressed, heldUsages: heldUsages)
     }
 
     @MainActor
     func injectRemoteMouse(dx: Int32, dy: Int32, wheelX: Int32, wheelY: Int32,
                            buttonMask: UInt8, updateButtons: Bool) {
-        if ExternalDisplay.shared.consoleOwnsInput {
-            let gameUps = remoteButtonsPosted.update([]).up
-            for b in gameUps { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
-            ExternalConsoleController.shared.lastInputKind = .remoteLAN
-            if dx != 0 || dy != 0 {
-                ExternalConsoleController.shared.moveCursor(dx: Double(dx), dy: Double(dy))
-            }
-            if wheelX != 0 || wheelY != 0 {
-                ExternalConsoleController.shared.handleMouseScroll(dx: Double(wheelX), dy: Double(wheelY))
-            }
-            if updateButtons {
-                let consoleEdges = remoteConsoleButtons.update(AOLMouseButtonMask.buttons(from: buttonMask))
-                for b in consoleEdges.up { ExternalConsoleController.shared.handleMouseButton(b, pressed: false) }
-                for b in consoleEdges.down { ExternalConsoleController.shared.handleMouseButton(b, pressed: true) }
-            }
-            return
-        }
-        guard Self.enabled else { return }
-        _ = remoteConsoleButtons.update([])
-        let focused = computeBaseFocus()
-        if focused {
-            if dx != 0 || dy != 0 {
-                setMouseInUse(true)
-                postMotion(Double(dx), Double(dy))
-            }
-            if wheelX != 0 || wheelY != 0 {
-                motionLock.lock()
-                let notches = wheel.add(Double(wheelX), Double(wheelY))
-                tickWheel += notches.count
-                motionLock.unlock()
-                for n in notches { winios_pointer(0, 0, n.flags, UInt32(bitPattern: n.delta)) }
-                if !notches.isEmpty { bumpTicker() }
-            }
-        }
-        if updateButtons {
-            let wantButtons = focused ? AOLMouseButtonMask.buttons(from: buttonMask) : []
-            if !wantButtons.isEmpty { setMouseInUse(true) }
-            let edges = remoteButtonsPosted.update(wantButtons)
-            for b in edges.up { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
-            for b in edges.down { let e = b.event(down: true); winios_pointer(0, 0, e.flags, e.data) }
-        }
-        startTicker()
+        injectRemoteMouseFast(dx: dx, dy: dy, wheelX: wheelX, wheelY: wheelY,
+                              buttonMask: buttonMask, updateButtons: updateButtons)
+    }
+
+    @MainActor
+    func setRemoteClientConnected(_ connected: Bool) {
+        remoteClientConnected = connected
+        refreshFocus(connected ? "aol connected" : "aol disconnected")
     }
 
     @MainActor
     func releaseAllRemoteInput() {
-        releaseRemoteKeys()
-        let gameUps = remoteButtonsPosted.update([]).up
-        for b in gameUps { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
-        _ = remoteConsoleButtons.update([])
-    }
-
-    private func releaseRemoteKeys() {
-        for vk in remoteKeysPosted.update([]).up {
-            winios_post_key(vk, 0)
-        }
+        releaseAllRemoteInputFast()
     }
 
     // MARK: - pointer lock
@@ -2687,6 +2797,7 @@ final class PadStickMouse: ObservableObject {
     private var appActive = true
     private var wanted = false
     private var started = false
+    private var remoteClientConnected = false
     private var toggleSink: AnyCancellable?
 
     /// Idempotent; main thread. Nothing with MADEIRA_HWINPUT=0.

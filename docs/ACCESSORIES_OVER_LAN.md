@@ -2,6 +2,11 @@
 
 AoL streams low-latency raw keyboard, mouse, and XInput gamepad events over UDP (`MAOL` v1, default UDP port `37419`) from a desktop PC (`tools/aol`) directly into Madeira on iOS, while streaming XInput rumble feedback back to the PC.
 
+Key transport and reliability features:
+- **Zero-jitter Wi-Fi QoS**: PC socket tags packets with DSCP EF (`0xB8` / WMM `AC_VO`); iOS uses `NWParameters.serviceClass = .interactiveVoice` and processes events directly on `.userInteractive` I/O threads without hopping onto `MainActor` during gameplay.
+- **250 Hz Mouse Coalescing + Redundant State Sync**: High-polling mice are coalesced to 4 ms frames and every key/button change schedules short redundant `STATE_SYNC` frames + 35 ms heartbeats while keys are held, plus a 350 ms dead-man release timer on iOS so brief Wi-Fi drops never leave keys stuck down.
+- **Persistent Key Pairing & Auto-Reconnect**: After initial PIN pairing (`--pin`), the PC stores an encrypted-masked 256-bit key (`~/.config/madeira-aol/paired.json`) and automatically reconnects across game switches, PIN regenerations, and iOS app restarts.
+
 ## Why AoL Exists
 
 iOS restricts USB HID access and non-MFi / raw high-polling mice and keyboards (for instance lacking raw multi-button mouse passthrough without AssistiveTouch on iPhone, blocking raw modifier/PrintScreen/F-key capture, or restricting exotic USB gamepads). Running `madeira-aol` on a Linux or Windows PC over Wi-Fi / USB-tether / Ethernet forwards raw OS events straight to Madeira's Wine/Winios input bridge and External Display TV Console Mode.

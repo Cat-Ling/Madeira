@@ -38,10 +38,20 @@ check(tag.count == 8, "authTag length")
 check(tag != [UInt8](repeating: 0, count: 8), "non-empty PIN authTag non-zero")
 check(AOLProtocol.authTag(pin: "") == [UInt8](repeating: 0, count: 8), "empty PIN zeros")
 
+let sampleDevID: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
+let sampleClientID: [UInt8] = [9, 8, 7, 6, 5, 4, 3, 2]
+let samplePairKey = [UInt8](1...32)
+let sampleNonce: [UInt8] = [0xAA, 0xBB, 0xCC, 0xDD, 1, 2, 3, 4]
+let pTag1 = AOLProtocol.pairedAuthTag(key: samplePairKey, clientID: sampleClientID, seq: 42)
+let pTag2 = AOLProtocol.pairedAuthTag(key: samplePairKey, clientID: sampleClientID, seq: 43)
+check(pTag1.count == 8 && pTag1 != pTag2, "pairedAuthTag varies by seq")
+let maskedKey = AOLProtocol.maskPairKey(pin: "1234", nonce: sampleNonce, key: samplePairKey)
+check(AOLProtocol.maskPairKey(pin: "1234", nonce: sampleNonce, key: maskedKey) == samplePairKey, "maskPairKey roundtrip")
+
 let packets: [AOLPacket] = [
     .discover,
-    .announce(AOLAnnounce(port: 37419, flags: 3, deviceName: "iPhone 16 Pro")),
-    .hello(AOLHello(flags: 0, deviceMask: 0x23, authTag: tag, hostName: "linux-box")),
+    .announce(AOLAnnounce(port: 37419, flags: 3 | AOLProtocol.announceFlagHasDeviceID, deviceName: "iPhone 16 Pro", deviceID: sampleDevID)),
+    .hello(AOLHello(flags: AOLProtocol.helloFlagWantPair | AOLProtocol.helloFlagHasClientID, deviceMask: 0x23, authTag: tag, hostName: "linux-box", clientID: sampleClientID)),
     .helloAck(AOLHelloAck(status: 0, sessionActive: true, tvActive: true, deviceName: "Madeira")),
     .ping(1234567890123),
     .pong(9876543210987),
@@ -52,7 +62,14 @@ let packets: [AOLPacket] = [
     .releaseAll(1),
     .rumble(AOLRumble(slot: 1, leftMotor: 65535, rightMotor: 12345)),
     .disconnect(4),
+    .stateSync(AOLStateSync(buttons: AOLProtocol.mouseButtonLeft | AOLProtocol.mouseButtonRight, held: [0x04, 0xE1])),
+    .pairGrant(AOLPairGrant(deviceID: sampleDevID, nonce: sampleNonce, maskedKey: maskedKey)),
 ]
+
+// Sequence ordering check (wrap-safe)
+check(AOLSeqTracker.isNewer(10, than: 9), "monotonic seq")
+check(!AOLSeqTracker.isNewer(9, than: 10), "reject older seq")
+check(AOLSeqTracker.isNewer(1, than: UInt32.max), "wraparound seq")
 
 for (idx, pkt) in packets.enumerated() {
     let encoded = AOLProtocol.encode(seq: UInt32(idx + 10), packet: pkt)
@@ -119,10 +136,19 @@ import (
 func main() {
 	dir := os.Args[1]
 	tag := protocol.AuthTag("1234")
+	devID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	cid := [8]byte{9, 8, 7, 6, 5, 4, 3, 2}
+	var pairKey [32]byte
+	for i := range pairKey {
+		pairKey[i] = byte(i + 1)
+	}
+	nonce := [8]byte{0xAA, 0xBB, 0xCC, 0xDD, 1, 2, 3, 4}
+	maskedKey := protocol.MaskPairKey("1234", nonce, pairKey)
+
 	packets := []protocol.Packet{
 		protocol.Discover{},
-		protocol.Announce{Port: 37419, Flags: 3, DeviceName: "iPhone 16 Pro"},
-		protocol.Hello{Flags: 0, DeviceMask: 0x23, AuthTag: tag, HostName: "linux-box"},
+		protocol.Announce{Port: 37419, Flags: 3 | protocol.AnnounceFlagHasDeviceID, DeviceName: "iPhone 16 Pro", DeviceID: devID},
+		protocol.Hello{Flags: protocol.HelloFlagWantPair | protocol.HelloFlagHasClientID, DeviceMask: 0x23, AuthTag: tag, HostName: "linux-box", ClientID: cid},
 		protocol.HelloAck{Status: 0, SessionActive: true, TVActive: true, DeviceName: "Madeira"},
 		protocol.Ping{TimestampUS: 1234567890123},
 		protocol.Pong{TimestampUS: 9876543210987},
@@ -133,6 +159,8 @@ func main() {
 		protocol.ReleaseAll{Reason: 1},
 		protocol.Rumble{Slot: 1, LeftMotor: 65535, RightMotor: 12345},
 		protocol.Disconnect{Reason: 4},
+		protocol.StateSync{Buttons: protocol.MouseButtonLeft | protocol.MouseButtonRight, Held: []uint16{0x04, 0xE1}},
+		protocol.PairGrant{DeviceID: devID, Nonce: nonce, MaskedKey: maskedKey},
 	}
 
 	// Verify Swift -> Go
@@ -194,8 +222,14 @@ def check_static_wiring():
         assert needle in gp, f"GamepadInput.swift missing {needle!r}"
 
     hw = read("app/Madeira/HardwareInput.swift")
-    for needle in ["injectRemoteKey(", "injectRemoteMouse(", "releaseAllRemoteInput()"]:
+    for needle in ["injectRemoteKey(", "injectRemoteKeyFast(", "injectRemoteMouse(", "injectRemoteMouseFast(", "injectRemoteStateSyncFast(", "releaseAllRemoteInput()"]:
         assert needle in hw, f"HardwareInput.swift missing {needle!r}"
+
+    aol_swift = read("app/Madeira/AccessoriesOverLAN.swift")
+    for needle in [".interactiveVoice", "private var portText: String { String(aol.port) }", "ForgetPairedPC", "forgetPairedPC("]:
+        if needle == "ForgetPairedPC":
+            continue
+        assert needle in aol_swift, f"AccessoriesOverLAN.swift missing {needle!r}"
 
     ed = read("app/Madeira/ExternalDisplayConsole.swift")
     for needle in ["RemoteAccessorySnapshot", "updateRemoteAccessories(", "remoteLAN"]:

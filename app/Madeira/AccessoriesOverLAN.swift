@@ -11,12 +11,14 @@ enum AOLPacketType: UInt8 {
     case mouseButton = 0x05
     case gamepadState = 0x06
     case releaseAll = 0x07
+    case stateSync = 0x08
 
     case announce = 0x80
     case helloAck = 0x81
     case pong = 0x82
     case rumble = 0x83
     case disconnect = 0x84
+    case pairGrant = 0x85
 }
 
 struct AOLHeader: Equatable {
@@ -29,6 +31,7 @@ struct AOLAnnounce: Equatable {
     var port: UInt16
     var flags: UInt8
     var deviceName: String
+    var deviceID: [UInt8] = []
 }
 
 struct AOLHello: Equatable {
@@ -36,10 +39,13 @@ struct AOLHello: Equatable {
     var deviceMask: UInt8
     var authTag: [UInt8]
     var hostName: String
+    var clientID: [UInt8] = []
 
     var hasKeyboard: Bool { (deviceMask & 0x01) != 0 }
     var hasMouse: Bool { (deviceMask & 0x02) != 0 }
     var gamepadCount: Int { Int((deviceMask >> 4) & 0x0F) }
+    var wantsPair: Bool { (flags & AOLProtocol.helloFlagWantPair) != 0 }
+    var isPairedKey: Bool { (flags & AOLProtocol.helloFlagPairedKey) != 0 }
 }
 
 struct AOLHelloAck: Equatable {
@@ -86,6 +92,17 @@ struct AOLRumble: Equatable {
     var rightMotor: UInt16
 }
 
+struct AOLStateSync: Equatable {
+    var buttons: UInt8
+    var held: [UInt16]
+}
+
+struct AOLPairGrant: Equatable {
+    var deviceID: [UInt8]
+    var nonce: [UInt8]
+    var maskedKey: [UInt8]
+}
+
 enum AOLPacket: Equatable {
     case discover
     case announce(AOLAnnounce)
@@ -100,6 +117,8 @@ enum AOLPacket: Equatable {
     case releaseAll(UInt8)
     case rumble(AOLRumble)
     case disconnect(UInt8)
+    case stateSync(AOLStateSync)
+    case pairGrant(AOLPairGrant)
 
     var packetType: AOLPacketType {
         switch self {
@@ -116,6 +135,8 @@ enum AOLPacket: Equatable {
         case .releaseAll: return .releaseAll
         case .rumble: return .rumble
         case .disconnect: return .disconnect
+        case .stateSync: return .stateSync
+        case .pairGrant: return .pairGrant
         }
     }
 }
@@ -129,6 +150,23 @@ enum AOLProtocol {
     static let statusOK: UInt8 = 0
     static let statusBadPIN: UInt8 = 1
     static let statusDisabled: UInt8 = 2
+    static let statusUnpaired: UInt8 = 3
+
+    static let helloFlagWantPair: UInt8 = 1 << 0
+    static let helloFlagPairedKey: UInt8 = 1 << 1
+    static let helloFlagHasClientID: UInt8 = 1 << 2
+
+    static let announceFlagRequirePIN: UInt8 = 1 << 0
+    static let announceFlagSession: UInt8 = 1 << 1
+    static let announceFlagHasDeviceID: UInt8 = 1 << 2
+
+    static let reasonNormal: UInt8 = 0
+    static let reasonUser: UInt8 = 1
+    static let reasonDisabled: UInt8 = 2
+    static let reasonRestart: UInt8 = 3
+    static let reasonSuperseded: UInt8 = 4
+    static let reasonTimeout: UInt8 = 5
+    static let reasonRehandshake: UInt8 = 6
 
     static let mouseButtonLeft: UInt8 = 1 << 0
     static let mouseButtonRight: UInt8 = 1 << 1
@@ -142,9 +180,30 @@ enum AOLProtocol {
         return Array(digest.prefix(8))
     }
 
+    static func pairedAuthTag(key: [UInt8], clientID: [UInt8], seq: UInt32) -> [UInt8] {
+        var msg = Data("MAOL-v1-key:".utf8)
+        msg.append(contentsOf: fixedBytes(key, count: 32))
+        msg.append(contentsOf: fixedBytes(clientID, count: 8))
+        appendUInt32LE(&msg, seq)
+        return Array(sha256(msg).prefix(8))
+    }
+
+    static func maskPairKey(pin: String, nonce: [UInt8], key: [UInt8]) -> [UInt8] {
+        var msg = Data("MAOL-v1-mask:".utf8)
+        msg.append(contentsOf: pin.utf8)
+        msg.append(contentsOf: fixedBytes(nonce, count: 8))
+        let mask = sha256(msg)
+        let k = fixedBytes(key, count: 32)
+        var out = [UInt8](repeating: 0, count: 32)
+        for i in 0..<32 {
+            out[i] = k[i] ^ mask[i]
+        }
+        return out
+    }
+
     static func encode(seq: UInt32, packet: AOLPacket) -> Data {
         var out = Data()
-        out.reserveCapacity(headerSize + 32)
+        out.reserveCapacity(headerSize + 48)
         out.append(0x4D) // 'M'
         out.append(0x41) // 'A'
         out.append(version)
@@ -156,15 +215,23 @@ enum AOLProtocol {
             break
         case .announce(let p):
             appendUInt16LE(&out, p.port)
-            out.append(p.flags)
+            let hasDevID = p.deviceID.count == 8 && p.deviceID.contains { $0 != 0 }
+            let flags = hasDevID ? (p.flags | announceFlagHasDeviceID) : p.flags
+            out.append(flags)
             appendShortString(&out, p.deviceName)
+            if (flags & announceFlagHasDeviceID) != 0 {
+                out.append(contentsOf: fixedBytes(p.deviceID, count: 8))
+            }
         case .hello(let p):
-            out.append(p.flags)
+            let hasClientID = p.clientID.count == 8 && p.clientID.contains { $0 != 0 }
+            let flags = hasClientID ? (p.flags | helloFlagHasClientID) : p.flags
+            out.append(flags)
             out.append(p.deviceMask)
-            var tag = [UInt8](repeating: 0, count: 8)
-            for i in 0..<min(8, p.authTag.count) { tag[i] = p.authTag[i] }
-            out.append(contentsOf: tag)
+            out.append(contentsOf: fixedBytes(p.authTag, count: 8))
             appendShortString(&out, p.hostName)
+            if (flags & helloFlagHasClientID) != 0 {
+                out.append(contentsOf: fixedBytes(p.clientID, count: 8))
+            }
         case .helloAck(let p):
             out.append(p.status)
             out.append(p.sessionActive ? 1 : 0)
@@ -203,6 +270,15 @@ enum AOLProtocol {
             out.append(p.slot)
             appendUInt16LE(&out, p.leftMotor)
             appendUInt16LE(&out, p.rightMotor)
+        case .stateSync(let p):
+            let held = Array(p.held.prefix(maxHeldKeys))
+            out.append(p.buttons)
+            out.append(UInt8(held.count))
+            for u in held { appendUInt16LE(&out, u) }
+        case .pairGrant(let p):
+            out.append(contentsOf: fixedBytes(p.deviceID, count: 8))
+            out.append(contentsOf: fixedBytes(p.nonce, count: 8))
+            out.append(contentsOf: fixedBytes(p.maskedKey, count: 32))
         }
         return out
     }
@@ -222,16 +298,34 @@ enum AOLProtocol {
             return (header, .discover)
         case .announce:
             guard body.count >= 4 else { return nil }
-            guard let (name, _) = readShortString(body, offset: 3) else { return nil }
-            return (header, .announce(AOLAnnounce(port: readUInt16LE(body, 0), flags: body[2], deviceName: name)))
+            let flags = body[2]
+            guard let (name, nextOffset) = readShortString(body, offset: 3) else { return nil }
+            var devID: [UInt8] = []
+            if (flags & announceFlagHasDeviceID) != 0 {
+                guard body.count >= nextOffset + 8 else { return nil }
+                devID = Array(body[nextOffset..<(nextOffset + 8)])
+            }
+            return (header, .announce(AOLAnnounce(
+                port: readUInt16LE(body, 0),
+                flags: flags,
+                deviceName: name,
+                deviceID: devID
+            )))
         case .hello:
             guard body.count >= 11 else { return nil }
-            guard let (host, _) = readShortString(body, offset: 10) else { return nil }
+            let flags = body[0]
+            guard let (host, nextOffset) = readShortString(body, offset: 10) else { return nil }
+            var cid: [UInt8] = []
+            if (flags & helloFlagHasClientID) != 0 {
+                guard body.count >= nextOffset + 8 else { return nil }
+                cid = Array(body[nextOffset..<(nextOffset + 8)])
+            }
             return (header, .hello(AOLHello(
-                flags: body[0],
+                flags: flags,
                 deviceMask: body[1],
                 authTag: Array(body[2..<10]),
-                hostName: host
+                hostName: host,
+                clientID: cid
             )))
         case .helloAck:
             guard body.count >= 4 else { return nil }
@@ -300,7 +394,30 @@ enum AOLProtocol {
         case .disconnect:
             guard body.count >= 1 else { return nil }
             return (header, .disconnect(body[0]))
+        case .stateSync:
+            guard body.count >= 2 else { return nil }
+            let count = min(Int(body[1]), maxHeldKeys)
+            guard body.count >= 2 + count * 2 else { return nil }
+            var held: [UInt16] = []
+            held.reserveCapacity(count)
+            for i in 0..<count {
+                held.append(readUInt16LE(body, 2 + i * 2))
+            }
+            return (header, .stateSync(AOLStateSync(buttons: body[0], held: held)))
+        case .pairGrant:
+            guard body.count >= 48 else { return nil }
+            return (header, .pairGrant(AOLPairGrant(
+                deviceID: Array(body[0..<8]),
+                nonce: Array(body[8..<16]),
+                maskedKey: Array(body[16..<48])
+            )))
         }
+    }
+
+    private static func fixedBytes(_ src: [UInt8], count: Int) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: count)
+        for i in 0..<min(count, src.count) { out[i] = src[i] }
+        return out
     }
 
     private static func appendUInt16LE(_ data: inout Data, _ v: UInt16) {
@@ -428,9 +545,7 @@ enum AOLProtocol {
     }
 }
 
-/// Self-healing key state tracker for UDP KEY_EVENT packets.
-/// Every KEY_EVENT carries up to `AOLProtocol.maxHeldKeys` currently held HID
-/// usages alongside the edge transition so lost release packets converge.
+/// Self-healing key state tracker for UDP KEY_EVENT and STATE_SYNC packets.
 struct AOLHeldKeyReconciler {
     private(set) var heldUsages: Set<UInt16> = []
 
@@ -454,8 +569,21 @@ struct AOLHeldKeyReconciler {
         return heldUsages
     }
 
+    @discardableResult
+    mutating func reconcile(held: [UInt16]) -> Set<UInt16> {
+        heldUsages = Set(held)
+        return heldUsages
+    }
+
     mutating func reset() {
         heldUsages.removeAll()
+    }
+}
+
+/// Wrap-safe 32-bit sequence ordering check to drop stale reordered UDP packets.
+enum AOLSeqTracker {
+    static func isNewer(_ seq: UInt32, than last: UInt32) -> Bool {
+        Int32(bitPattern: seq &- last) > 0
     }
 }
 
@@ -465,6 +593,7 @@ import SwiftUI
 import Network
 import Combine
 import Darwin
+import Security
 
 private extension AOLMouseMotion {
     static let allMouseButtons: [(mask: UInt8, button: MouseButton)] = [
@@ -486,6 +615,368 @@ enum AOLMouseButtonMask {
     }
 }
 
+struct PairedAOLPC: Codable, Identifiable, Equatable {
+    var id: String // ClientID hex
+    var hostName: String
+    var keyBase64: String
+    var pairedAt: Date
+}
+
+/// Lock-protected hot-path session core executing directly on `ioQueue` without
+/// MainActor hops for zero-jitter input processing, 350ms stuck-key recovery, and rumble polling.
+private final class AOLSessionCore: @unchecked Sendable {
+    let ioQueue = DispatchQueue(label: "madeira.aol.udp", qos: .userInteractive)
+    private let lock = NSLock()
+
+    private weak var owner: AccessoriesOverLAN?
+    private var activeConnection: NWConnection?
+    private var lastPacketAt: TimeInterval = 0
+    private var lastPingSentAt: TimeInterval = 0
+    private var lastStateSeq: UInt32 = 0
+    private var lastPadSeq = [UInt32](repeating: 0, count: 4)
+    private var keyReconciler = AOLHeldKeyReconciler()
+    private var heldMouseMask: UInt8 = 0
+    private var padConnectedMask: UInt8 = 0
+    private var stalledReleased = false
+    private var txSeq: UInt32 = 1
+    private var latestLatencyMs: Int?
+    private var publishedLatencyMs: Int?
+    private var lastRehandshakeHintAt: TimeInterval = 0
+    private var lastVibrationSerial = [UInt32](repeating: 0, count: 4)
+    private var watchdogTimer: DispatchSourceTimer?
+    private var rumbleTimer: DispatchSourceTimer?
+
+    init(owner: AccessoriesOverLAN) {
+        self.owner = owner
+    }
+
+    func activate(connection: NWConnection) {
+        lock.lock()
+        let prev = activeConnection
+        activeConnection = connection
+        let now = ProcessInfo.processInfo.systemUptime
+        lastPacketAt = now
+        lastPingSentAt = now
+        lastStateSeq = 0
+        lastPadSeq = [0, 0, 0, 0]
+        keyReconciler.reset()
+        heldMouseMask = 0
+        padConnectedMask = 0
+        stalledReleased = false
+        latestLatencyMs = nil
+        publishedLatencyMs = nil
+        lastVibrationSerial = [0, 0, 0, 0]
+        lock.unlock()
+
+        if let prev, prev !== connection {
+            send(.disconnect(AOLProtocol.reasonSuperseded), on: prev)
+            prev.cancel()
+        }
+        startTimersLocked()
+    }
+
+    func deactivate(connection: NWConnection? = nil, sendReason: UInt8? = nil) -> NWConnection? {
+        lock.lock()
+        if let connection, activeConnection !== connection {
+            lock.unlock()
+            return nil
+        }
+        let old = activeConnection
+        activeConnection = nil
+        lastStateSeq = 0
+        lastPadSeq = [0, 0, 0, 0]
+        keyReconciler.reset()
+        heldMouseMask = 0
+        padConnectedMask = 0
+        stalledReleased = false
+        latestLatencyMs = nil
+        publishedLatencyMs = nil
+        let rt = rumbleTimer
+        rumbleTimer = nil
+        let wt = watchdogTimer
+        watchdogTimer = nil
+        lock.unlock()
+
+        rt?.cancel()
+        wt?.cancel()
+        if let old {
+            if let sendReason {
+                send(.disconnect(sendReason), on: old)
+            }
+            old.cancel()
+        }
+        return old
+    }
+
+    func resetGameSessionState(hasGamepads: Bool) {
+        lock.lock()
+        keyReconciler.reset()
+        heldMouseMask = 0
+        lastVibrationSerial = [0, 0, 0, 0]
+        lock.unlock()
+        HardwareInput.shared.releaseAllRemoteInputFast()
+        if hasGamepads && winios_gamepad_rumble_caps() == 0 {
+            winios_gamepad_set_rumble_caps(1)
+        }
+    }
+
+    func handleDatagram(_ data: Data, on connection: NWConnection) {
+        guard let decoded = AOLProtocol.decode(data) else { return }
+        let header = decoded.header
+        let packet = decoded.packet
+
+        switch packet {
+        case .discover, .hello:
+            Task { @MainActor [weak owner] in
+                owner?.handleControlPacket(header: header, packet: packet, on: connection)
+            }
+            return
+        default:
+            break
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        guard activeConnection === connection else {
+            let shouldHint = (now - lastRehandshakeHintAt) >= 0.2
+            if shouldHint { lastRehandshakeHintAt = now }
+            lock.unlock()
+            if shouldHint {
+                send(.disconnect(AOLProtocol.reasonRehandshake), on: connection)
+            }
+            return
+        }
+        lastPacketAt = now
+        stalledReleased = false
+
+        switch packet {
+        case .ping(let ts):
+            lock.unlock()
+            send(.pong(ts), on: connection)
+
+        case .pong(let sentUS):
+            let nowUS = UInt64(now * 1_000_000)
+            if nowUS >= sentUS {
+                latestLatencyMs = max(0, Int((nowUS - sentUS) / 1000))
+            }
+            lock.unlock()
+
+        case .keyEvent(let ev):
+            if lastStateSeq != 0 && !AOLSeqTracker.isNewer(header.seq, than: lastStateSeq) {
+                lock.unlock()
+                return
+            }
+            lastStateSeq = header.seq
+            let held = keyReconciler.apply(ev)
+            lock.unlock()
+            HardwareInput.shared.injectRemoteKeyFast(hidUsage: ev.hidUsage, pressed: ev.pressed, heldUsages: held)
+
+        case .mouseMotion(let m):
+            let allowButtons = lastStateSeq == 0 || AOLSeqTracker.isNewer(header.seq, than: lastStateSeq)
+            if allowButtons {
+                lastStateSeq = header.seq
+                heldMouseMask = m.buttons
+            }
+            lock.unlock()
+            HardwareInput.shared.injectRemoteMouseFast(
+                dx: Int32(m.dx),
+                dy: Int32(m.dy),
+                wheelX: Int32(m.wheelX),
+                wheelY: Int32(m.wheelY),
+                buttonMask: m.buttons,
+                updateButtons: allowButtons
+            )
+
+        case .mouseButton(let b):
+            if lastStateSeq != 0 && !AOLSeqTracker.isNewer(header.seq, than: lastStateSeq) {
+                lock.unlock()
+                return
+            }
+            lastStateSeq = header.seq
+            heldMouseMask = b.buttons
+            lock.unlock()
+            HardwareInput.shared.injectRemoteMouseFast(
+                dx: 0, dy: 0, wheelX: 0, wheelY: 0,
+                buttonMask: b.buttons, updateButtons: true
+            )
+
+        case .stateSync(let s):
+            if lastStateSeq != 0 && !AOLSeqTracker.isNewer(header.seq, than: lastStateSeq) {
+                lock.unlock()
+                return
+            }
+            lastStateSeq = header.seq
+            let held = keyReconciler.reconcile(held: s.held)
+            heldMouseMask = s.buttons
+            lock.unlock()
+            HardwareInput.shared.injectRemoteStateSyncFast(buttonMask: s.buttons, heldUsages: held)
+
+        case .gamepadState(let pad):
+            guard pad.slot < 4 else {
+                lock.unlock()
+                return
+            }
+            let slot = Int(pad.slot)
+            if lastPadSeq[slot] != 0 && !AOLSeqTracker.isNewer(header.seq, than: lastPadSeq[slot]) {
+                lock.unlock()
+                return
+            }
+            lastPadSeq[slot] = header.seq
+            if pad.connected {
+                padConnectedMask |= UInt8(1 << slot)
+            } else {
+                padConnectedMask &= ~UInt8(1 << slot)
+            }
+            lock.unlock()
+            if pad.connected {
+                let sample = GamepadSample(
+                    buttons: pad.buttons,
+                    lt: pad.leftTrigger,
+                    rt: pad.rightTrigger,
+                    lx: pad.lx,
+                    ly: pad.ly,
+                    rx: pad.rx,
+                    ry: pad.ry
+                )
+                GamepadInput.shared.setRemotePad(slot: slot, sample: sample)
+            } else {
+                GamepadInput.shared.setRemotePad(slot: slot, sample: nil)
+            }
+
+        case .releaseAll:
+            keyReconciler.reset()
+            heldMouseMask = 0
+            lock.unlock()
+            HardwareInput.shared.releaseAllRemoteInputFast()
+
+        case .disconnect:
+            lock.unlock()
+            Task { @MainActor [weak owner] in
+                owner?.handleRemoteDisconnect(connection: connection)
+            }
+
+        case .discover, .announce, .hello, .helloAck, .rumble, .pairGrant:
+            lock.unlock()
+        }
+    }
+
+    func send(_ packet: AOLPacket, on connection: NWConnection) {
+        lock.lock()
+        let seq = txSeq
+        txSeq &+= 1
+        lock.unlock()
+        let data = AOLProtocol.encode(seq: seq, packet: packet)
+        ioQueue.async {
+            connection.send(content: data, completion: .contentProcessed { _ in })
+        }
+    }
+
+    private func startTimersLocked() {
+        lock.lock()
+        let oldRumble = rumbleTimer
+        let oldDog = watchdogTimer
+
+        let rumble = DispatchSource.makeTimerSource(queue: ioQueue)
+        rumble.schedule(deadline: .now() + .milliseconds(16), repeating: .milliseconds(16), leeway: .milliseconds(4))
+        rumble.setEventHandler { [weak self] in
+            self?.pollRumble()
+        }
+        rumbleTimer = rumble
+
+        let dog = DispatchSource.makeTimerSource(queue: ioQueue)
+        dog.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(20))
+        dog.setEventHandler { [weak self] in
+            self?.tickWatchdog()
+        }
+        watchdogTimer = dog
+        lock.unlock()
+
+        oldRumble?.cancel()
+        oldDog?.cancel()
+        rumble.resume()
+        dog.resume()
+    }
+
+    private func tickWatchdog() {
+        let now = ProcessInfo.processInfo.systemUptime
+        var timedOutConn: NWConnection?
+        var releaseStalled = false
+        var pingConn: NWConnection?
+        var pingTimestampUS: UInt64 = 0
+        var publishRTT: Int?
+        var shouldPublishRTT = false
+
+        lock.lock()
+        if let conn = activeConnection {
+            let idle = now - lastPacketAt
+            if idle > 3.5 {
+                timedOutConn = conn
+            } else {
+                let held = !keyReconciler.heldUsages.isEmpty || heldMouseMask != 0 || padConnectedMask != 0
+                if held && !stalledReleased && idle > 0.35 {
+                    stalledReleased = true
+                    keyReconciler.reset()
+                    heldMouseMask = 0
+                    padConnectedMask = 0
+                    releaseStalled = true
+                }
+                if now - lastPingSentAt >= 1.0 {
+                    lastPingSentAt = now
+                    pingConn = conn
+                    pingTimestampUS = UInt64(now * 1_000_000)
+                    if latestLatencyMs != publishedLatencyMs {
+                        publishedLatencyMs = latestLatencyMs
+                        publishRTT = latestLatencyMs
+                        shouldPublishRTT = true
+                    }
+                }
+            }
+        }
+        lock.unlock()
+
+        if let timedOutConn {
+            Task { @MainActor [weak owner] in
+                owner?.handleWatchdogTimeout(connection: timedOutConn)
+            }
+            return
+        }
+        if releaseStalled {
+            HardwareInput.shared.releaseAllRemoteInputFast()
+            GamepadInput.shared.clearRemotePads()
+        }
+        if let pingConn {
+            send(.ping(pingTimestampUS), on: pingConn)
+        }
+        if shouldPublishRTT {
+            Task { @MainActor [weak owner] in
+                owner?.updateLatencyUI(publishRTT)
+            }
+        }
+    }
+
+    private func pollRumble() {
+        lock.lock()
+        guard let conn = activeConnection else {
+            lock.unlock()
+            return
+        }
+        var changed: [AOLRumble] = []
+        for slot in 0..<4 {
+            var vib = winios_gamepad_vibration()
+            let serial = winios_gamepad_get_vibration(Int32(slot), &vib)
+            if serial != lastVibrationSerial[slot] {
+                lastVibrationSerial[slot] = serial
+                changed.append(AOLRumble(slot: UInt8(slot), leftMotor: vib.left, rightMotor: vib.right))
+            }
+        }
+        lock.unlock()
+
+        for r in changed {
+            send(.rumble(r), on: conn)
+        }
+    }
+}
+
 @MainActor
 final class AccessoriesOverLAN: ObservableObject {
     static let shared = AccessoriesOverLAN()
@@ -496,12 +987,14 @@ final class AccessoriesOverLAN: ObservableObject {
         static let requirePIN = "aol.requirePIN"
         static let pin = "aol.pin"
         static let bonjour = "aol.bonjour"
+        static let deviceID = "aol.deviceID"
+        static let pairedPCs = "aol.pairedPCs"
     }
 
     @Published var enabled: Bool {
         didSet {
             UserDefaults.standard.set(enabled, forKey: Keys.enabled)
-            if enabled { startListener() } else { stopListener(reason: 2) }
+            if enabled { startListener() } else { stopListener(reason: AOLProtocol.reasonDisabled) }
         }
     }
 
@@ -543,18 +1036,15 @@ final class AccessoriesOverLAN: ObservableObject {
     @Published private(set) var clientCapabilities = (keyboard: false, mouse: false, gamepads: 0)
     @Published private(set) var latencyMs: Int?
     @Published private(set) var localAddresses: [String] = []
-    @Published private(set) var packetsReceived: UInt64 = 0
+    @Published private(set) var pairedPCs: [PairedAOLPC] = []
 
-    private let ioQueue = DispatchQueue(label: "madeira.aol.udp", qos: .userInteractive)
+    private let deviceIDBytes: [UInt8]
     private var listener: NWListener?
     private var activeConnection: NWConnection?
-    private var txSeq: UInt32 = 1
-    private var keyReconciler = AOLHeldKeyReconciler()
-    private var rumbleTimer: DispatchSourceTimer?
-    private var watchdogTimer: DispatchSourceTimer?
-    private var lastPacketAt: TimeInterval = 0
-    private var lastVibrationSerial = [UInt32](repeating: 0, count: 4)
-    private var rumbleEnabled = false
+    private var core: AOLSessionCore?
+    private var observers: [NSObjectProtocol] = []
+    private var sessionCancellable: AnyCancellable?
+    private var started = false
 
     private init() {
         let d = UserDefaults.standard
@@ -565,17 +1055,33 @@ final class AccessoriesOverLAN: ObservableObject {
             defaultPIN = String(format: "%04d", Int.random(in: 1000...9999))
             d.set(defaultPIN, forKey: Keys.pin)
         }
+
+        if let devData = d.data(forKey: Keys.deviceID), devData.count == 8 {
+            self.deviceIDBytes = [UInt8](devData)
+        } else {
+            let fresh = Self.randomBytes(8)
+            d.set(Data(fresh), forKey: Keys.deviceID)
+            self.deviceIDBytes = fresh
+        }
+
+        if let pairedData = d.data(forKey: Keys.pairedPCs),
+           let decoded = try? JSONDecoder().decode([PairedAOLPC].self, from: pairedData) {
+            self.pairedPCs = decoded
+        }
+
         let savedPort = d.integer(forKey: Keys.port)
         self.enabled = d.object(forKey: Keys.enabled) == nil ? false : d.bool(forKey: Keys.enabled)
         self.port = savedPort >= 1024 && savedPort <= 65535 ? savedPort : Int(AOLProtocol.defaultPort)
         self.requirePIN = d.object(forKey: Keys.requirePIN) == nil ? true : d.bool(forKey: Keys.requirePIN)
         self.pin = defaultPIN
         self.bonjourEnabled = d.object(forKey: Keys.bonjour) == nil ? true : d.bool(forKey: Keys.bonjour)
+        self.core = AOLSessionCore(owner: self)
         refreshLocalAddresses()
     }
 
     func startIfEnabled() {
         refreshLocalAddresses()
+        installLifecycleObservers()
         if enabled { startListener() }
     }
 
@@ -584,7 +1090,17 @@ final class AccessoriesOverLAN: ObservableObject {
     }
 
     func disconnectClient() {
-        disconnectActiveClient(reason: 1)
+        disconnectActiveClient(reason: AOLProtocol.reasonUser)
+    }
+
+    func forgetPairedPC(id: String) {
+        pairedPCs.removeAll { $0.id == id }
+        savePairedPCs()
+    }
+
+    func forgetAllPairedPCs() {
+        pairedPCs.removeAll()
+        savePairedPCs()
     }
 
     func refreshLocalAddresses() {
@@ -612,13 +1128,39 @@ final class AccessoriesOverLAN: ObservableObject {
         localAddresses = addrs
     }
 
+    private func installLifecycleObservers() {
+        guard !started else { return }
+        started = true
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.releaseAllInputs()
+            }
+        })
+        observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.refreshLocalAddresses()
+                if self.enabled && self.listener == nil {
+                    self.startListener()
+                }
+            }
+        })
+        sessionCancellable = LibraryModel.shared.$current.sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.core?.resetGameSessionState(hasGamepads: self.clientCapabilities.gamepads > 0)
+            }
+        }
+    }
+
     private func restartListener() {
-        stopListener(reason: 3)
+        stopListener(reason: AOLProtocol.reasonRestart)
         startListener()
     }
 
     private func startListener() {
-        guard listener == nil else { return }
+        guard listener == nil, let core else { return }
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             listenerError = "Invalid UDP port \(port)"
             return
@@ -627,6 +1169,7 @@ final class AccessoriesOverLAN: ObservableObject {
         do {
             let params = NWParameters.udp
             params.allowLocalEndpointReuse = true
+            params.serviceClass = .interactiveVoice
             let newListener = try NWListener(using: params, on: nwPort)
             if bonjourEnabled {
                 newListener.service = NWListener.Service(name: UIDevice.current.name, type: "_madeira-aol._udp")
@@ -636,13 +1179,14 @@ final class AccessoriesOverLAN: ObservableObject {
                     self?.handleListenerState(state)
                 }
             }
-            newListener.newConnectionHandler = { [weak self] connection in
-                self?.acceptConnection(connection)
+            newListener.newConnectionHandler = { [weak core] connection in
+                guard let core else { return }
+                Self.acceptConnection(connection, core: core)
             }
-            newListener.start(queue: ioQueue)
+            newListener.start(queue: core.ioQueue)
             listener = newListener
             listenerError = nil
-            LogStore.shared.log("[aol] listening UDP :\(port) bonjour=\(bonjourEnabled ? 1 : 0)")
+            LogStore.shared.log("[aol] listening UDP :\(port) serviceClass=interactiveVoice bonjour=\(bonjourEnabled ? 1 : 0)")
         } catch {
             listenerError = error.localizedDescription
             listening = false
@@ -676,45 +1220,40 @@ final class AccessoriesOverLAN: ObservableObject {
         }
     }
 
-    private nonisolated func acceptConnection(_ connection: NWConnection) {
-        connection.start(queue: ioQueue)
-        receiveLoop(on: connection)
+    private nonisolated static func acceptConnection(_ connection: NWConnection, core: AOLSessionCore) {
+        connection.start(queue: core.ioQueue)
+        receiveLoop(on: connection, core: core)
     }
 
-    private nonisolated func receiveLoop(on connection: NWConnection) {
-        connection.receiveMessage { [weak self] content, _, _, error in
+    private nonisolated static func receiveLoop(on connection: NWConnection, core: AOLSessionCore) {
+        connection.receiveMessage { content, _, _, error in
             if let data = content, !data.isEmpty {
-                self?.handleRawDatagram(data, on: connection)
+                core.handleDatagram(data, on: connection)
             }
             if error == nil && connection.state != .cancelled {
-                self?.receiveLoop(on: connection)
+                receiveLoop(on: connection, core: core)
             }
         }
     }
 
-    private nonisolated func handleRawDatagram(_ data: Data, on connection: NWConnection) {
-        guard let decoded = AOLProtocol.decode(data) else { return }
-        Task { @MainActor [weak self] in
-            self?.handleDecodedPacket(decoded.header, decoded.packet, on: connection)
-        }
-    }
-
-    private func handleDecodedPacket(_ header: AOLHeader, _ packet: AOLPacket, on connection: NWConnection) {
+    fileprivate func handleControlPacket(header: AOLHeader, packet: AOLPacket, on connection: NWConnection) {
+        guard let core else { return }
         switch packet {
         case .discover:
-            var flags: UInt8 = requirePIN ? 0x01 : 0x00
-            if LibraryModel.shared.current != nil { flags |= 0x02 }
+            var flags: UInt8 = requirePIN ? AOLProtocol.announceFlagRequirePIN : 0
+            if LibraryModel.shared.current != nil { flags |= AOLProtocol.announceFlagSession }
+            flags |= AOLProtocol.announceFlagHasDeviceID
             let reply = AOLPacket.announce(AOLAnnounce(
                 port: UInt16(port),
                 flags: flags,
-                deviceName: UIDevice.current.name
+                deviceName: UIDevice.current.name,
+                deviceID: deviceIDBytes
             ))
-            send(reply, on: connection)
-            return
+            core.send(reply, on: connection)
 
         case .hello(let hello):
             guard enabled else {
-                send(.helloAck(AOLHelloAck(
+                core.send(.helloAck(AOLHelloAck(
                     status: AOLProtocol.statusDisabled,
                     sessionActive: LibraryModel.shared.current != nil,
                     tvActive: ExternalDisplay.shared.isActive,
@@ -722,10 +1261,41 @@ final class AccessoriesOverLAN: ObservableObject {
                 )), on: connection)
                 return
             }
+
+            if hello.isPairedKey {
+                let cidHex = Self.hexString(hello.clientID)
+                guard hello.clientID.count == 8,
+                      let paired = pairedPCs.first(where: { $0.id == cidHex }),
+                      let keyData = Data(base64Encoded: paired.keyBase64),
+                      keyData.count == 32 else {
+                    core.send(.helloAck(AOLHelloAck(
+                        status: AOLProtocol.statusUnpaired,
+                        sessionActive: LibraryModel.shared.current != nil,
+                        tvActive: ExternalDisplay.shared.isActive,
+                        deviceName: UIDevice.current.name
+                    )), on: connection)
+                    LogStore.shared.log("[aol] rejected paired-key HELLO from \(hello.hostName): unknown clientID")
+                    return
+                }
+                let expected = AOLProtocol.pairedAuthTag(key: [UInt8](keyData), clientID: hello.clientID, seq: header.seq)
+                guard hello.authTag == expected else {
+                    core.send(.helloAck(AOLHelloAck(
+                        status: AOLProtocol.statusUnpaired,
+                        sessionActive: LibraryModel.shared.current != nil,
+                        tvActive: ExternalDisplay.shared.isActive,
+                        deviceName: UIDevice.current.name
+                    )), on: connection)
+                    LogStore.shared.log("[aol] rejected paired-key HELLO from \(hello.hostName): bad authTag")
+                    return
+                }
+                activateClient(connection, hello: hello, issuePairGrant: false)
+                return
+            }
+
             if requirePIN {
                 let expected = AOLProtocol.authTag(pin: pin)
                 guard hello.authTag == expected else {
-                    send(.helloAck(AOLHelloAck(
+                    core.send(.helloAck(AOLHelloAck(
                         status: AOLProtocol.statusBadPIN,
                         sessionActive: LibraryModel.shared.current != nil,
                         tvActive: ExternalDisplay.shared.isActive,
@@ -735,122 +1305,86 @@ final class AccessoriesOverLAN: ObservableObject {
                     return
                 }
             }
-            activateClient(connection, hello: hello)
-            return
+            activateClient(connection, hello: hello, issuePairGrant: hello.wantsPair && hello.clientID.count == 8)
 
         default:
             break
         }
-
-        guard activeConnection === connection else { return }
-        lastPacketAt = ProcessInfo.processInfo.systemUptime
-        packetsReceived &+= 1
-
-        switch packet {
-        case .ping(let ts):
-            send(.pong(ts), on: connection)
-        case .pong(let sentUS):
-            let nowUS = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000)
-            if nowUS >= sentUS {
-                latencyMs = max(0, Int((nowUS - sentUS) / 1000))
-                syncDisplaySnapshot()
-            }
-        case .keyEvent(let ev):
-            let held = keyReconciler.apply(ev)
-            HardwareInput.shared.injectRemoteKey(hidUsage: ev.hidUsage, pressed: ev.pressed, heldUsages: held)
-        case .mouseMotion(let m):
-            HardwareInput.shared.injectRemoteMouse(
-                dx: Int32(m.dx),
-                dy: Int32(m.dy),
-                wheelX: Int32(m.wheelX),
-                wheelY: Int32(m.wheelY),
-                buttonMask: m.buttons,
-                updateButtons: true
-            )
-        case .mouseButton(let b):
-            HardwareInput.shared.injectRemoteMouse(
-                dx: 0,
-                dy: 0,
-                wheelX: 0,
-                wheelY: 0,
-                buttonMask: b.buttons,
-                updateButtons: true
-            )
-        case .gamepadState(let pad):
-            guard pad.slot < 4 else { return }
-            if pad.connected {
-                let sample = GamepadSample(
-                    buttons: pad.buttons,
-                    lt: pad.leftTrigger,
-                    rt: pad.rightTrigger,
-                    lx: pad.lx,
-                    ly: pad.ly,
-                    rx: pad.rx,
-                    ry: pad.ry
-                )
-                GamepadInput.shared.setRemotePad(slot: Int(pad.slot), sample: sample)
-            } else {
-                GamepadInput.shared.setRemotePad(slot: Int(pad.slot), sample: nil)
-            }
-        case .releaseAll:
-            releaseAllInputs()
-        case .disconnect:
-            disconnectActiveClient(reason: 0, sendPacket: false)
-        case .discover, .announce, .hello, .helloAck, .rumble:
-            break
-        }
     }
 
-    private func activateClient(_ connection: NWConnection, hello: AOLHello) {
-        if let prev = activeConnection, prev !== connection {
-            send(.disconnect(4), on: prev)
-            prev.cancel()
-        }
+    private func activateClient(_ connection: NWConnection, hello: AOLHello, issuePairGrant: Bool) {
+        guard let core else { return }
         releaseAllInputs()
         activeConnection = connection
+        core.activate(connection: connection)
+
         clientConnected = true
         clientHost = hello.hostName.isEmpty ? "PC Host" : hello.hostName
         clientCapabilities = (hello.hasKeyboard, hello.hasMouse, min(4, hello.gamepadCount))
         latencyMs = nil
-        lastPacketAt = ProcessInfo.processInfo.systemUptime
-        packetsReceived = 0
-        for i in 0..<4 { lastVibrationSerial[i] = 0 }
+        HardwareInput.shared.setRemoteClientConnected(true)
 
         if clientCapabilities.gamepads > 0 && winios_gamepad_rumble_caps() == 0 {
             winios_gamepad_set_rumble_caps(1)
-            rumbleEnabled = true
         }
 
-        send(.helloAck(AOLHelloAck(
+        core.send(.helloAck(AOLHelloAck(
             status: AOLProtocol.statusOK,
             sessionActive: LibraryModel.shared.current != nil,
             tvActive: ExternalDisplay.shared.isActive,
             deviceName: UIDevice.current.name
         )), on: connection)
 
-        startClientTimers()
+        if issuePairGrant {
+            let cidHex = Self.hexString(hello.clientID)
+            let rawKey = Self.randomBytes(32)
+            let nonce = Self.randomBytes(8)
+            let maskPin = requirePIN ? pin : ""
+            let masked = AOLProtocol.maskPairKey(pin: maskPin, nonce: nonce, key: rawKey)
+            upsertPairedPC(PairedAOLPC(
+                id: cidHex,
+                hostName: clientHost,
+                keyBase64: Data(rawKey).base64EncodedString(),
+                pairedAt: Date()
+            ))
+            core.send(.pairGrant(AOLPairGrant(
+                deviceID: deviceIDBytes,
+                nonce: nonce,
+                maskedKey: masked
+            )), on: connection)
+            LogStore.shared.log("[aol] paired PC '\(clientHost)' id=\(cidHex)")
+        }
+
         syncDisplaySnapshot()
-        LogStore.shared.log("[aol] connected host='\(clientHost)' kb=\(clientCapabilities.keyboard) mouse=\(clientCapabilities.mouse) pads=\(clientCapabilities.gamepads)")
+        LogStore.shared.log("[aol] connected host='\(clientHost)' auth=\(hello.isPairedKey ? "key" : "pin") kb=\(clientCapabilities.keyboard) mouse=\(clientCapabilities.mouse) pads=\(clientCapabilities.gamepads)")
+    }
+
+    fileprivate func handleRemoteDisconnect(connection: NWConnection) {
+        guard activeConnection === connection else { return }
+        disconnectActiveClient(reason: AOLProtocol.reasonNormal, sendPacket: false)
+    }
+
+    fileprivate func handleWatchdogTimeout(connection: NWConnection) {
+        guard activeConnection === connection else { return }
+        LogStore.shared.log("[aol] client '\(clientHost)' timed out")
+        disconnectActiveClient(reason: AOLProtocol.reasonTimeout, sendPacket: false)
+    }
+
+    fileprivate func updateLatencyUI(_ ms: Int?) {
+        guard clientConnected else { return }
+        latencyMs = ms
+        syncDisplaySnapshot()
     }
 
     private func disconnectActiveClient(reason: UInt8, sendPacket: Bool = true) {
         let wasConnected = clientConnected || activeConnection != nil
-        if let conn = activeConnection {
-            if sendPacket { send(.disconnect(reason), on: conn) }
-            conn.cancel()
-        }
+        _ = core?.deactivate(sendReason: sendPacket ? reason : nil)
         activeConnection = nil
         clientConnected = false
         clientHost = ""
         clientCapabilities = (false, false, 0)
         latencyMs = nil
-        rumbleTimer?.cancel()
-        rumbleTimer = nil
-        watchdogTimer?.cancel()
-        watchdogTimer = nil
-        if rumbleEnabled {
-            rumbleEnabled = false
-        }
+        HardwareInput.shared.setRemoteClientConnected(false)
         releaseAllInputs()
         syncDisplaySnapshot()
         if wasConnected {
@@ -859,65 +1393,22 @@ final class AccessoriesOverLAN: ObservableObject {
     }
 
     private func releaseAllInputs() {
-        keyReconciler.reset()
-        HardwareInput.shared.releaseAllRemoteInput()
+        HardwareInput.shared.releaseAllRemoteInputFast()
         GamepadInput.shared.clearRemotePads()
     }
 
-    private func startClientTimers() {
-        rumbleTimer?.cancel()
-        let rumble = DispatchSource.makeTimerSource(queue: .main)
-        rumble.schedule(deadline: .now() + .milliseconds(16), repeating: .milliseconds(16), leeway: .milliseconds(4))
-        rumble.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
-                self?.pollRumble()
-            }
+    private func upsertPairedPC(_ entry: PairedAOLPC) {
+        if let idx = pairedPCs.firstIndex(where: { $0.id == entry.id }) {
+            pairedPCs[idx] = entry
+        } else {
+            pairedPCs.append(entry)
         }
-        rumble.resume()
-        rumbleTimer = rumble
-
-        watchdogTimer?.cancel()
-        let dog = DispatchSource.makeTimerSource(queue: .main)
-        dog.schedule(deadline: .now() + 1, repeating: 1)
-        dog.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, self.clientConnected else { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                if now - self.lastPacketAt > 4.0 {
-                    LogStore.shared.log("[aol] client '\(self.clientHost)' timed out")
-                    self.disconnectActiveClient(reason: 5, sendPacket: false)
-                } else if let conn = self.activeConnection {
-                    let nowUS = UInt64(now * 1_000_000)
-                    self.send(.ping(nowUS), on: conn)
-                }
-            }
-        }
-        dog.resume()
-        watchdogTimer = dog
+        savePairedPCs()
     }
 
-    private func pollRumble() {
-        guard clientConnected, let conn = activeConnection else { return }
-        for slot in 0..<4 {
-            var vib = winios_gamepad_vibration()
-            let serial = winios_gamepad_get_vibration(Int32(slot), &vib)
-            if serial != lastVibrationSerial[slot] {
-                lastVibrationSerial[slot] = serial
-                send(.rumble(AOLRumble(
-                    slot: UInt8(slot),
-                    leftMotor: vib.left,
-                    rightMotor: vib.right
-                )), on: conn)
-            }
-        }
-    }
-
-    private func send(_ packet: AOLPacket, on connection: NWConnection) {
-        let seq = txSeq
-        txSeq &+= 1
-        let data = AOLProtocol.encode(seq: seq, packet: packet)
-        ioQueue.async {
-            connection.send(content: data, completion: .contentProcessed { _ in })
+    private func savePairedPCs() {
+        if let data = try? JSONEncoder().encode(pairedPCs) {
+            UserDefaults.standard.set(data, forKey: Keys.pairedPCs)
         }
     }
 
@@ -931,10 +1422,24 @@ final class AccessoriesOverLAN: ObservableObject {
             mouse: clientCapabilities.mouse
         ))
     }
+
+    private static func randomBytes(_ count: Int) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: count)
+        if SecRandomCopyBytes(kSecRandomDefault, count, &bytes) != errSecSuccess {
+            for i in 0..<count { bytes[i] = UInt8.random(in: 0...255) }
+        }
+        return bytes
+    }
+
+    private static func hexString(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 struct AccessoriesOverLANSettingsSection: View {
     @ObservedObject private var aol = AccessoriesOverLAN.shared
+
+    private var portText: String { String(aol.port) }
 
     var body: some View {
         Group {
@@ -948,7 +1453,7 @@ struct AccessoriesOverLANSettingsSection: View {
 
             Section("Status & Connection") {
                 LabeledContent("Listener") {
-                    Text(aol.listening ? "UDP :\(aol.port)" : (aol.enabled ? "Starting…" : "Off"))
+                    Text(aol.listening ? "UDP :\(portText)" : (aol.enabled ? "Starting…" : "Off"))
                         .foregroundStyle(aol.listening ? .green : .secondary)
                 }
                 if let err = aol.listenerError, !err.isEmpty {
@@ -956,13 +1461,13 @@ struct AccessoriesOverLANSettingsSection: View {
                 }
                 if let primaryIP = aol.localAddresses.first {
                     LabeledContent("Target address") {
-                        Text("\(primaryIP):\(aol.port)")
+                        Text("\(primaryIP):\(portText)")
                             .font(.system(.body, design: .monospaced))
                     }
                     if aol.localAddresses.count > 1 {
                         ForEach(aol.localAddresses.dropFirst(), id: \.self) { ip in
                             LabeledContent("Alternate IP") {
-                                Text("\(ip):\(aol.port)")
+                                Text("\(ip):\(portText)")
                                     .font(.system(.caption, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
@@ -999,8 +1504,35 @@ struct AccessoriesOverLANSettingsSection: View {
             } header: { Text("Pairing") } footer: {
                 if let ip = aol.localAddresses.first {
                     let pinArg = aol.requirePIN ? " --pin \(aol.pin)" : ""
-                    Text("Run on PC: madeira-aol --target \(ip):\(aol.port)\(pinArg)")
+                    Text("Run on PC: madeira-aol --target \(ip):\(portText)\(pinArg)")
                         .font(.system(.caption, design: .monospaced))
+                }
+            }
+
+            if !aol.pairedPCs.isEmpty {
+                Section {
+                    ForEach(aol.pairedPCs) { pc in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(pc.hostName)
+                                Text("Key ID \(pc.id.prefix(8))")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Forget", role: .destructive) {
+                                aol.forgetPairedPC(id: pc.id)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    if aol.pairedPCs.count > 1 {
+                        Button("Forget All Paired PCs", role: .destructive) {
+                            aol.forgetAllPairedPCs()
+                        }
+                    }
+                } header: { Text("Paired PCs") } footer: {
+                    Text("Paired PCs reconnect automatically even if you regenerate the PIN.")
                 }
             }
 
