@@ -15,7 +15,7 @@ Why: DXVK's hard requirements (`src/dxvk/dxvk_device_info.cpp`, the
 `DxvkDeviceCapabilities::checkDeviceCompatibility`) against the two Vulkan-on-Metal
 drivers Madeira bundles:
 
-- KosmicKrisp (Mesa 26.2.7, `src/kosmickrisp/vulkan/kk_physical_device.c`) has every
+- KosmicKrisp (Mesa 26.3.1, `src/kosmickrisp/vulkan/kk_physical_device.c`) has every
   other required feature and extension, Vulkan 1.4 and 256 bytes of push constants, but
   no `geometryShader`, no `fillModeNonSolid` and no `VK_EXT_depth_clip_enable` (it has
   `VK_EXT_depth_clip_control` only). Unpatched, DXVK skips it with "Device does not

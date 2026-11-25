@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-screen = root / "build/mesa-d3d12/work/mesa-26.2.7/src/gallium/drivers/d3d12/d3d12_screen.cpp"
+screen = root / "build/mesa-d3d12/work/mesa-26.3.1/src/gallium/drivers/d3d12/d3d12_screen.cpp"
 if not screen.exists():
     print("SKIP: run build/mesa-d3d12/build.sh first")
     sys.exit(0)
