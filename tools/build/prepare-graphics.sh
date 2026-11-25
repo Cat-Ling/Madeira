@@ -57,7 +57,7 @@ case "${1:-}" in
   kosmickrisp)
     python_tools
     COMPONENT=kosmickrisp
-    mesa 26.2.4 bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9
+    mesa 26.2.7 04294f75d22e9f61cd1e050206bc48b3d39366e788f1803a3368e3d5a872ce18
     LLVM="$(brew --prefix llvm@21)"
     TRANSLATOR="$C/SPIRV-LLVM-Translator-29758b55816c14abb3e4142d42aca7a95bf46710"
     checkout "$TRANSLATOR" https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git 29758b55816c14abb3e4142d42aca7a95bf46710

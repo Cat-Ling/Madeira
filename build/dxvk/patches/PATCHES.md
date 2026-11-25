@@ -1,21 +1,21 @@
 # DXVK patches
 
 Applied in numeric order by `build/dxvk/build.sh` (`patch -p1`) to upstream DXVK
-`v3.1.1` (`b1a1c99ab52b687cf950d62c88bc2fa316b41663`). Madeira's own (2026-10-13), zlib
+`master-20261124` (`654a2410e795883bca660383c95a09a0c00e471e`). Madeira's own (2026-10-13), zlib
 licence like DXVK. Devices that have the features below take DXVK's upstream paths
 unchanged; the patch only matters on a driver that lacks them.
 
 | Patch | Summary |
 |---|---|
 | 0001-vulkan-on-metal-optional-features.patch | geometryShader, fillModeNonSolid, shaderCullDistance and VK_EXT_depth_clip_enable become optional (upstream refuses the device: "Device does not support required feature ..."). One `warn: Madeira: no ...` line per missing feature; D3D11 geometry shaders are not bound on a device without them; wireframe draws solid; depth clip is expressed through depthClampEnable in pipelines and pipeline libraries |
-| 0002-playport-unshareable-handle-and-memory-drain.patch | Ports Playport DXVK fixes: clears external-memory `handleType` on unshareable images so Win32 handle exports are not queried, drains pending GPU frees when a mandatory allocation hits the heap budget, and throws `DxvkError` (unregistering the resource) instead of returning null storage |
+| 0002-playport-unshareable-handle-and-memory-drain.patch | Ports Playport DXVK fixes: clears external-memory `handleType` on unshareable buffers (the `dxvk_image` guard is already upstream in `654a2410e`), drains pending GPU frees when a mandatory allocation hits the heap budget, and throws `DxvkError` (unregistering the resource) instead of returning null storage |
 
-Why: DXVK 3.1.1's hard requirements (`src/dxvk/dxvk_device_info.cpp`, the
+Why: DXVK's hard requirements (`src/dxvk/dxvk_device_info.cpp`, the
 `ENABLE_*(..., true)` rows of the feature table, checked by
 `DxvkDeviceCapabilities::checkDeviceCompatibility`) against the two Vulkan-on-Metal
 drivers Madeira bundles:
 
-- KosmicKrisp (Mesa 26.2.4, `src/kosmickrisp/vulkan/kk_physical_device.c`) has every
+- KosmicKrisp (Mesa 26.2.7, `src/kosmickrisp/vulkan/kk_physical_device.c`) has every
   other required feature and extension, Vulkan 1.4 and 256 bytes of push constants, but
   no `geometryShader`, no `fillModeNonSolid` and no `VK_EXT_depth_clip_enable` (it has
   `VK_EXT_depth_clip_control` only). Unpatched, DXVK skips it with "Device does not

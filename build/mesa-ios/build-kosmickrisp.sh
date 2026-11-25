@@ -11,8 +11,8 @@
 # Step 1 builds them natively (Linux or macOS), step 2 cross-compiles the
 # driver with -Dmesa-clc=system -Dprecomp-compiler=system.
 #
-# Source: Mesa 26.2.4 (https://archive.mesa3d.org/mesa-26.2.4.tar.xz, sha256
-# bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9), with
+# Source: Mesa 26.2.7 (https://archive.mesa3d.org/mesa-26.2.7.tar.xz, sha256
+# 04294f75d22e9f61cd1e050206bc48b3d39366e788f1803a3368e3d5a872ce18), with
 # build/mesa-ios/patches/kosmickrisp-ios-*.patch applied (MIT, like Mesa).
 #
 # Build-machine needs: meson >= 1.9.1, ninja, python3 with mako/pyyaml/packaging,
@@ -25,7 +25,7 @@ set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$R/build/mesa-ios"
 WORK="${KK_WORK:-$HOME/.cache/mesa-kk}"
-SRC="${KK_MESA_SRC:-$WORK/mesa-26.2.4}"
+SRC="${KK_MESA_SRC:-$WORK/mesa-26.2.7}"
 NATIVE="$WORK/build-native"
 TOOLS="$WORK/host-tools"
 B="$WORK/build-ios"
@@ -35,7 +35,7 @@ SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 
 if [ ! -f "$SRC/src/kosmickrisp/meson.build" ]; then
     echo "Mesa >= 25.3 source not found at $SRC" >&2
-    echo "  curl -LO https://archive.mesa3d.org/mesa-26.2.4.tar.xz && tar -xf mesa-26.2.4.tar.xz -C \"$WORK\"" >&2
+    echo "  curl -LO https://archive.mesa3d.org/mesa-26.2.7.tar.xz && tar -xf mesa-26.2.7.tar.xz -C \"$WORK\"" >&2
     exit 1
 fi
 

@@ -32,8 +32,8 @@ set -euo pipefail
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
-DXVK_TAG=v3.1.1
-DXVK_COMMIT=b1a1c99ab52b687cf950d62c88bc2fa316b41663
+DXVK_TAG=master-20261124
+DXVK_COMMIT=654a2410e795883bca660383c95a09a0c00e471e
 DXVK_URL=https://github.com/doitsujin/dxvk.git
 DXVK_SRC="${DXVK_SRC:-$REPO_ROOT/toolchains/dxvk-src}"
 DXVK_WORK="${DXVK_WORK:-$REPO_ROOT/toolchains/dxvk-build}"

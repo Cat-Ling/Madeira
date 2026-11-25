@@ -55,21 +55,18 @@ diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
 index dae3218..4568768 100644
 --- a/src/dxmt/dxmt_context.hpp
 +++ b/src/dxmt/dxmt_context.hpp
-@@ -882,6 +882,13 @@ public:
- 
-   uint32_t tess_num_output_control_point_element;
-   uint32_t tess_threads_per_patch;
-+  /* madeira-bcd tess-pso-failed-v1 (round 626; tools/patch-dxmt-tess-pso-failed.py): the last tessellation / geometry mesh pipeline
-+   * this context set did not compile; the mesh draws of that kind that follow are dropped (d3d11_context_impl.cpp). */
-+  bool tess_pso_failed = false;
-+  bool gs_pso_failed = false;
+@@ -885,7 +885,10 @@ public:
+   /* madeira-bcd tess-pso-failed-v1 (round 626; tools/patch-dxmt-tess-pso-failed.py): the last tessellation / geometry mesh pipeline
+    * this context set did not compile; the mesh draws of that kind that follow are dropped (d3d11_context_impl.cpp). */
+   bool tess_pso_failed = false;
+   bool gs_pso_failed = false;
 +
 +  WMT::Device device_;
 +  CommandQueue& queue_;
  
    EmulatedCommandContext emulated_cmd;
    ClearRenderTargetContext clear_rt_cmd;
-@@ -967,9 +974,6 @@ private:
+@@ -971,9 +974,6 @@ private:
    Flags<FeatureCompatibility> compatibility_flag_;
  
    std::vector<Rc<VisibilityResultQuery> *> deferred_visibility_query_stack_;

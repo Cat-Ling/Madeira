@@ -1,7 +1,7 @@
 # vkd3d-proton patches
 
 Applied in numeric order by `build/vkd3d-proton/build.sh` (`patch -p1`) to upstream
-vkd3d-proton `750061ae2be846d19d6364628eaf5ea4beb8e619`. Patches `0001`–`0003` come
+vkd3d-proton `ec20719452e916baa2b9e69f33f18de4561a8313`. Patches `0001`–`0003` come
 from NutsEmu 0.0.1 build 1382 and `0004`–`0010` come from NutsEmu 0.0.1 build 1977
 (Evan Bolton, published corresponding source, `patches/vkd3d-proton/`),
 LGPL-2.1-or-later like vkd3d-proton. Each file's header keeps the origin and the

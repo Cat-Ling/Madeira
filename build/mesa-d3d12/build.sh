@@ -20,9 +20,9 @@ CACHE="$REPO_ROOT/toolchains/mesa-d3d12"
 WORK="$BUILD_DIR/work"
 OUT="$REPO_ROOT/app/Madeira/x86_64-opengl"
 
-MESA_VERSION=26.2.4
+MESA_VERSION=26.2.7
 MESA_URL="https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz"
-MESA_SHA256=bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9
+MESA_SHA256=04294f75d22e9f61cd1e050206bc48b3d39366e788f1803a3368e3d5a872ce18
 DXC_URL="https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip"
 DXC_SHA256=ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
 DXIL_SHA256=64be2368211d257a038a7d4ea6bb3e24c878eb8d588c7b8414fccf759b69c2ac

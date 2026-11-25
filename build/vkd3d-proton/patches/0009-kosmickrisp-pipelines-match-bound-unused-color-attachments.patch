@@ -140,10 +140,11 @@ Generated-by: LLM
  };
  
  bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
-@@ -2891,6 +2894,8 @@
+@@ -2894,6 +2897,8 @@
      VkRect2D scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
      VkSampleCountFlagBits rasterization_samples;
      uint32_t view_mask;
+     bool multiple_viewports;
 +    uint32_t rtv_count;
 +    VkFormat rtv_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
  

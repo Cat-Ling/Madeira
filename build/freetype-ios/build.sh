@@ -3,8 +3,8 @@
 # which compiles freetype_ios.c against these headers and merges
 # build/libfreetype.a into libwin32u_unix.a (no Xcode project changes).
 #
-# Source: shallow clone of freetype 2.13.3 in research/freetype
-#   git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+# Source: shallow clone of freetype 2.15.0 in research/freetype
+#   git clone --depth 1 --branch VER-2-15-0 https://github.com/freetype/freetype.git research/freetype
 # All optional deps disabled — fonts are plain TTFs from wine/fonts/.
 set -e
 
@@ -15,7 +15,7 @@ SRC="$REPO_ROOT/research/freetype"
 if [ ! -f "$SRC/CMakeLists.txt" ]; then
     [ ! -e "$SRC" ] || { echo "ERROR: $SRC exists without CMakeLists.txt; preserve or repair it first" >&2; exit 1; }
     mkdir -p "$(dirname "$SRC")"
-    git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git "$SRC"
+    git clone --depth 1 --branch VER-2-15-0 https://github.com/freetype/freetype.git "$SRC"
 fi
 
 

@@ -58,19 +58,6 @@ index 3b5b739..457e6f2 100644
    }
  
  
-@@ -334,7 +341,11 @@ namespace dxvk {
-     allocationInfo.resourceCookie = cookie();
-     allocationInfo.properties = m_properties;
-     allocationInfo.mode = mode;
--    allocationInfo.handleType = m_info.sharing.type;
-+    // Playport: only images that passed canShareImage() carry exportable memory;
-+    // unshareable images must not trigger win32 external handle queries.
-+    allocationInfo.handleType = m_shared
-+      ? m_info.sharing.type
-+      : VK_EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BITS_MAX_ENUM;
- 
-     if (m_info.transient)
-       allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
 diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
 index fc18044..f9727ce 100644
 --- a/src/dxvk/dxvk_memory.cpp
