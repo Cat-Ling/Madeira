@@ -115,24 +115,19 @@ check("GuestDisplay.swift applies externalResolutionOverride", "externalResoluti
 
 plist = plistlib.loads((APP / "Info.plist").read_bytes())
 manifest = plist.get("UIApplicationSceneManifest") or {}
-configs = manifest.get("UISceneConfigurations") or {}
-ext_configs = configs.get("UIWindowSceneSessionRoleExternalDisplayNonInteractive") or []
 check(
-    "Info.plist declares UIWindowSceneSessionRoleExternalDisplayNonInteractive scene delegate",
-    bool(ext_configs) and ext_configs[0].get("UISceneDelegateClassName") == "MadeiraExternalDisplaySceneDelegate",
-    ext_configs,
+    "Info.plist sets UIApplicationSceneManifest with UIApplicationSupportsMultipleScenes = false and omits UISceneConfigurations",
+    manifest.get("UIApplicationSupportsMultipleScenes") is False and "UISceneConfigurations" not in manifest,
+    manifest,
 )
 check(
-    "Info.plist leaves UIWindowSceneSessionRoleApplication unmanaged for SwiftUI WindowGroup",
-    "UIWindowSceneSessionRoleApplication" not in configs,
-)
-check(
-    "ExternalDisplayConsole.swift implements MadeiraExternalDisplaySceneDelegate",
-    "@objc(MadeiraExternalDisplaySceneDelegate)" in ext_src
-    and "UIWindowSceneDelegate" in ext_src
-    and "attachExternalScene" in ext_src
-    and "detachExternalScene" in ext_src
-    and "overscanCompensation = .none" in ext_src,
+    "ExternalDisplayConsole.swift matches MeloNX AirPlay windowScene binding",
+    "UIScreen.didConnectNotification" in ext_src
+    and "UIApplication.shared.connectedScenes" in ext_src
+    and "w.windowScene = scene" in ext_src
+    and "overscanCompensation = .none" in ext_src
+    and "w.isHidden = false" in ext_src
+    and "ExternalDisplaySceneDelegate" not in ext_src,
 )
 
 print("PASS: ExternalDisplay Console & Companion wiring" if ok else "FAILED: ExternalDisplay Console & Companion checks")

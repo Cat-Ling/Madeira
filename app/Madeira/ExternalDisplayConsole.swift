@@ -330,14 +330,13 @@ final class ExternalDisplay: ObservableObject {
     var onEnableJIT: (() -> Void)?
 
     private(set) var window: UIWindow?
-    private weak var attachedScene: UIWindowScene?
-    private weak var attachedDelegate: ExternalDisplaySceneDelegate?
     private var gameHostContainer: UIView?
     private var hostingController: UIHostingController<ExternalDisplayRootView>?
     private var started = false
     private var retryWork: DispatchWorkItem?
     private var overscanGuideHideWork: DispatchWorkItem?
     private var sessionCancellable: AnyCancellable?
+    private var lastDiagnostic: String = ""
 
     private init() {
         let d = UserDefaults.standard
@@ -397,8 +396,11 @@ final class ExternalDisplay: ObservableObject {
                      UIScene.didActivateNotification,
                      UIScene.didDisconnectNotification,
                      UIApplication.didBecomeActiveNotification] {
-            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.update() }
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                let connectedScreen = note.name == UIScreen.didConnectNotification ? (note.object as? UIScreen) : nil
+                Task { @MainActor [weak self] in
+                    self?.update(preferredScreen: connectedScreen)
+                }
             }
         }
         GuestDisplay.externalResolutionOverride = { gameResolution in
@@ -457,43 +459,30 @@ final class ExternalDisplay: ObservableObject {
         HardwareInput.shared.syncConsoleRouting(isActive: isActive, consoleOwnsInput: consoleOwnsInput)
     }
 
-    func attachExternalScene(_ scene: UIWindowScene, delegate: ExternalDisplaySceneDelegate) {
-        attachedScene = scene
-        attachedDelegate = delegate
-        start()
-        update()
-    }
-
-    func detachExternalScene(_ scene: UIWindowScene) {
-        if attachedScene === scene {
-            attachedScene = nil
-            attachedDelegate?.window = nil
-            attachedDelegate = nil
+    private func externalScene(for preferredScreen: UIScreen? = nil) -> UIWindowScene? {
+        let targetScreen = preferredScreen ?? UIScreen.screens.first(where: { $0 !== UIScreen.main })
+        let windowScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let targetScreen, let exact = windowScenes.first(where: { $0.screen === targetScreen }) {
+            return exact
         }
-        update()
-    }
-
-    private func externalScene() -> UIWindowScene? {
-        if let attached = attachedScene,
-           attached.session.role == .windowExternalDisplayNonInteractive || attached.screen !== UIScreen.main {
-            return attached
+        return windowScenes.first {
+            $0.session.role == .windowExternalDisplayNonInteractive || $0.screen !== UIScreen.main
         }
-        return UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first { $0.session.role == .windowExternalDisplayNonInteractive || $0.screen !== UIScreen.main }
     }
 
-    func update(retryCount: Int = 0) {
+    func update(preferredScreen: UIScreen? = nil, retryCount: Int = 0) {
         retryWork?.cancel()
-        let hasExtraScreen = UIScreen.screens.count > 1 || externalScene() != nil
+        let extraScreen = preferredScreen ?? UIScreen.screens.first(where: { $0 !== UIScreen.main })
+        let matchedScene = externalScene(for: extraScreen)
+        let hasExtraScreen = extraScreen != nil || matchedScene != nil
         if isConnected != hasExtraScreen { isConnected = hasExtraScreen }
 
-        let scene = Self.enabled && userEnabled ? externalScene() : nil
+        let scene = Self.enabled && userEnabled ? matchedScene : nil
         if let scene {
             let screen = scene.screen
             // Disable UIKit's default overscan inset so Madeira's own TV safe-area slider is exact.
             screen.overscanCompensation = .none
-            let bounds = scene.coordinateSpace.bounds
+            let bounds = screen.bounds.isEmpty ? scene.coordinateSpace.bounds : screen.bounds
             let native = screen.nativeBounds.size
             let fps = max(1, screen.maximumFramesPerSecond)
             if bounds != screenBounds { screenBounds = bounds }
@@ -502,12 +491,12 @@ final class ExternalDisplay: ObservableObject {
 
             if window?.windowScene !== scene {
                 teardownWindow(reason: "rebind")
-                let w = UIWindow(windowScene: scene)
-                w.frame = bounds
+                let w = UIWindow(frame: bounds)
                 w.backgroundColor = .black
                 w.overrideUserInterfaceStyle = .dark
 
                 let rootVC = UIViewController()
+                rootVC.view.frame = CGRect(origin: .zero, size: bounds.size)
                 rootVC.view.backgroundColor = .black
 
                 let gameContainer = UIView(frame: rootVC.view.bounds)
@@ -524,19 +513,19 @@ final class ExternalDisplay: ObservableObject {
                 hostVC.didMove(toParent: rootVC)
 
                 w.rootViewController = rootVC
+                w.windowScene = scene
                 // Keep the phone window key so hardware/touch input is not stolen by the non-interactive TV scene.
                 w.isHidden = false
-                attachedDelegate?.window = w
 
                 self.window = w
                 self.gameHostContainer = gameContainer
                 self.hostingController = hostVC
                 self.isActive = true
+                self.lastDiagnostic = ""
                 ExternalConsoleController.shared.resetCursor(in: bounds.size)
                 fputs("[display] external console on: \(Int(bounds.width))x\(Int(bounds.height)) native=\(Int(native.width))x\(Int(native.height)) @\(fps)Hz\n", stderr)
                 LogStore.shared.log("[display] external console on: \(Int(bounds.width))x\(Int(bounds.height)) (native \(Int(native.width))x\(Int(native.height))) @\(fps)Hz")
             } else {
-                attachedDelegate?.window = window
                 if let w = window, w.frame != bounds { w.frame = bounds }
                 if !isActive { isActive = true }
             }
@@ -548,21 +537,40 @@ final class ExternalDisplay: ObservableObject {
             MetalBackedView.refreshDisplayMode(reason: "external-display")
         } else {
             teardownWindow(reason: hasExtraScreen ? "disabled" : "disconnected")
-            // AirPlay/UxPlay UIScreen notifications sometimes arrive before UIWindowScene connects.
-            if Self.enabled && userEnabled && hasExtraScreen && retryCount < 10 {
-                let work = DispatchWorkItem { [weak self] in
-                    MainActor.assumeIsolated {
-                        self?.update(retryCount: retryCount + 1)
-                    }
+            if hasExtraScreen {
+                let sceneDesc = UIApplication.shared.connectedScenes.map { s in
+                    let isMain = (s as? UIWindowScene)?.screen === UIScreen.main
+                    return "\(s.session.role.rawValue)(main=\(isMain))"
+                }.joined(separator: ",")
+                let diag = "[display] extra screen detected without active external scene: screens=\(UIScreen.screens.count) scenes=[\(sceneDesc)] enabled=\(Self.enabled) userEnabled=\(userEnabled) retry=\(retryCount)"
+                if diag != lastDiagnostic && (retryCount == 0 || retryCount >= 15) {
+                    lastDiagnostic = diag
+                    fputs(diag + "\n", stderr)
+                    LogStore.shared.log(diag)
                 }
-                retryWork = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+            } else {
+                lastDiagnostic = ""
+            }
+            // AirPlay/UxPlay UIScreen notifications sometimes arrive before UIWindowScene connects.
+            if Self.enabled && userEnabled && hasExtraScreen && retryCount < 15 {
+                if retryCount == 0 {
+                    Task { @MainActor [weak self] in
+                        self?.update(preferredScreen: extraScreen, retryCount: 1)
+                    }
+                } else {
+                    let work = DispatchWorkItem { [weak self] in
+                        MainActor.assumeIsolated {
+                            self?.update(preferredScreen: extraScreen, retryCount: retryCount + 1)
+                        }
+                    }
+                    retryWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+                }
             }
         }
     }
 
     private func teardownWindow(reason: String) {
-        attachedDelegate?.window = nil
         guard let old = window else {
             if isActive { isActive = false }
             publishThreadSafeState()
@@ -2146,36 +2154,6 @@ struct ExternalPhoneCompanionView: View {
             }
             .buttonStyle(.bordered)
         }
-    }
-}
-
-@objc(MadeiraExternalDisplaySceneDelegate)
-@MainActor
-final class ExternalDisplaySceneDelegate: UIResponder, UIWindowSceneDelegate {
-    var window: UIWindow?
-
-    func scene(
-        _ scene: UIScene,
-        willConnectTo session: UISceneSession,
-        options connectionOptions: UIScene.ConnectionOptions
-    ) {
-        guard let windowScene = scene as? UIWindowScene else { return }
-        ExternalDisplay.shared.attachExternalScene(windowScene, delegate: self)
-    }
-
-    func sceneDidDisconnect(_ scene: UIScene) {
-        guard let windowScene = scene as? UIWindowScene else { return }
-        window = nil
-        ExternalDisplay.shared.detachExternalScene(windowScene)
-    }
-
-    func windowScene(
-        _ windowScene: UIWindowScene,
-        didUpdate previousCoordinateSpace: UICoordinateSpace,
-        interfaceOrientation previousInterfaceOrientation: UIInterfaceOrientation,
-        traitCollection previousTraitCollection: UITraitCollection
-    ) {
-        ExternalDisplay.shared.update()
     }
 }
 #endif
