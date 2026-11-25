@@ -8,6 +8,7 @@ unchanged; the patch only matters on a driver that lacks them.
 | Patch | Summary |
 |---|---|
 | 0001-vulkan-on-metal-optional-features.patch | geometryShader, fillModeNonSolid, shaderCullDistance and VK_EXT_depth_clip_enable become optional (upstream refuses the device: "Device does not support required feature ..."). One `warn: Madeira: no ...` line per missing feature; D3D11 geometry shaders are not bound on a device without them; wireframe draws solid; depth clip is expressed through depthClampEnable in pipelines and pipeline libraries |
+| 0002-playport-unshareable-handle-and-memory-drain.patch | Ports Playport DXVK fixes: clears external-memory `handleType` on unshareable images so Win32 handle exports are not queried, drains pending GPU frees when a mandatory allocation hits the heap budget, and throws `DxvkError` (unregistering the resource) instead of returning null storage |
 
 Why: DXVK 3.1.1's hard requirements (`src/dxvk/dxvk_device_info.cpp`, the
 `ENABLE_*(..., true)` rows of the feature table, checked by

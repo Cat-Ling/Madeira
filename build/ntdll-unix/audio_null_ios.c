@@ -38,6 +38,7 @@
 #include <mach/mach_time.h>
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
+#include <os/workgroup.h>
 #include <unistd.h>
 #include <time.h>
 #include <AudioToolbox/AudioToolbox.h>
@@ -369,6 +370,15 @@ struct ios_stream {
     /* MADEIRA_AUDIO_RESUME: mach time up to which ios_stream_drain has
      * played this stream's ring by the clock while iOS held the endpoint stopped. */
     uint64_t drain_mach;
+    /* Playport (PLA-364, decision 0172): steady producer promotion + underrun hysteresis */
+    uint64_t caller_tid;
+    UINT32 caller_run;
+    uint64_t producer_tid;
+    UINT32 producer_lines;
+    _Atomic uint64_t caller_switches;
+    struct ios_rt_thread *rt;
+    _Atomic uint32_t short_history;
+    _Atomic uint32_t refill_callbacks;
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -533,6 +543,274 @@ static void stream_unregister(struct ios_stream *s)
     fprintf(stderr, "[ios-astream] ml739 RELEASE stream=%p (%d still live)\n", (void *)s, n);
 }
 
+#define IOS_PRODUCER_STEADY_CALLS 32
+#define IOS_PRODUCER_LINES 16
+#define IOS_RT_PERIOD_NS       10000000ull
+#define IOS_RT_COMPUTATION_NS   5000000ull
+#define IOS_RT_CONSTRAINT_NS   10000000ull
+#define IOS_RT_CHECK_NS      2000000000ull
+#define IOS_RT_MAX_CPU_PERCENT 80
+#define IOS_REFILL_SHORTS 2
+#define IOS_REFILL_MS 20u
+#define IOS_REFILL_MAX_CALLBACKS 3u
+
+struct ios_rt_thread {
+    int streams;
+    int alive;
+    _Atomic int promoted;
+    int refused;
+    mach_port_t port;
+    unsigned long long tid;
+    os_workgroup_interval_t wi;
+    os_workgroup_join_token_s token;
+    int joined;
+    int in_cycle;
+    uint64_t cycles, cycle_errors;
+    uint64_t check_mach, check_cpu_us;
+};
+
+static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t g_rt_key;
+static pthread_once_t g_rt_once = PTHREAD_ONCE_INIT;
+static int g_rt_on = 1;
+static int g_refill_on = 1;
+static int g_audio_diag = 1;
+
+static uint64_t ios_ns_to_mach(uint64_t ns);
+static uint64_t mach_to_ns(uint64_t mach);
+static unsigned long long ios_current_tid(void);
+static int ios_stream_is_live(const struct ios_stream *s);
+
+static int ios_producer_note(struct ios_stream *s, uint64_t tid)
+{
+    if (tid != s->caller_tid) {
+        if (s->caller_tid) atomic_fetch_add_explicit(&s->caller_switches, 1, memory_order_relaxed);
+        s->caller_tid = tid;
+        s->caller_run = 0;
+    }
+    if (!s->started || s->caller_run >= IOS_PRODUCER_STEADY_CALLS) return 0;
+    if (++s->caller_run < IOS_PRODUCER_STEADY_CALLS || tid == s->producer_tid) return 0;
+    s->producer_tid = tid;
+    return 1;
+}
+
+static kern_return_t ios_rt_set_policy(mach_port_t port, int on)
+{
+    if (on) {
+        thread_time_constraint_policy_data_t tc;
+        tc.period = (uint32_t)ios_ns_to_mach(IOS_RT_PERIOD_NS);
+        tc.computation = (uint32_t)ios_ns_to_mach(IOS_RT_COMPUTATION_NS);
+        tc.constraint = (uint32_t)ios_ns_to_mach(IOS_RT_CONSTRAINT_NS);
+        tc.preemptible = TRUE;
+        return thread_policy_set(port, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tc,
+                                 THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    }
+    {
+        thread_standard_policy_data_t st = { 0 };
+        return thread_policy_set(port, THREAD_STANDARD_POLICY, (thread_policy_t)&st,
+                                 THREAD_STANDARD_POLICY_COUNT);
+    }
+}
+
+static void ios_rt_demote_locked(struct ios_rt_thread *t, const char *why)
+{
+    kern_return_t kr;
+    if (!t->alive || !atomic_load_explicit(&t->promoted, memory_order_relaxed)) return;
+    kr = ios_rt_set_policy(t->port, 0);
+    atomic_store_explicit(&t->promoted, 0, memory_order_relaxed);
+    if (g_audio_diag)
+        fprintf(stderr, "[ios_audio] rt demote tid=0x%llx (%s) kr=%d\n", t->tid, why, kr);
+}
+
+static void ios_rt_free_locked(struct ios_rt_thread *t)
+{
+    mach_port_deallocate(mach_task_self(), t->port);
+    free(t);
+}
+
+static void ios_rt_release_locked(struct ios_rt_thread *t, const char *why)
+{
+    if (--t->streams > 0) return;
+    ios_rt_demote_locked(t, why);
+    if (!t->alive) ios_rt_free_locked(t);
+}
+
+static void ios_rt_finish_self(struct ios_rt_thread *t)
+{
+    if (!t->in_cycle) return;
+    t->in_cycle = 0;
+    if (os_workgroup_interval_finish(t->wi, NULL)) t->cycle_errors++;
+}
+
+static void ios_rt_leave_self(struct ios_rt_thread *t)
+{
+    if (!t->joined) return;
+    ios_rt_finish_self(t);
+    os_workgroup_leave(t->wi, &t->token);
+    t->joined = 0;
+}
+
+static void ios_rt_join_self(struct ios_rt_thread *t)
+{
+    int r;
+    if (t->joined) return;
+    if (!t->wi && !(t->wi = AudioWorkIntervalCreate("madeira.audio-producer", OS_CLOCK_MACH_ABSOLUTE_TIME, NULL))) {
+        fprintf(stderr, "[ios_audio] rt interval tid=0x%llx: AudioWorkIntervalCreate failed\n", t->tid);
+        return;
+    }
+    if ((r = os_workgroup_join(t->wi, &t->token))) {
+        fprintf(stderr, "[ios_audio] rt join tid=0x%llx refused: %d\n", t->tid, r);
+        return;
+    }
+    t->joined = 1;
+    if (g_audio_diag) fprintf(stderr, "[ios_audio] rt join tid=0x%llx own interval\n", t->tid);
+}
+
+static void ios_rt_thread_exit(void *arg)
+{
+    struct ios_rt_thread *t = arg;
+    ios_rt_leave_self(t);
+    if (t->wi) os_release(t->wi);
+    t->wi = NULL;
+    pthread_mutex_lock(&g_rt_lock);
+    t->alive = 0;
+    if (!t->streams) ios_rt_free_locked(t);
+    pthread_mutex_unlock(&g_rt_lock);
+}
+
+static void ios_rt_key_init(void) { pthread_key_create(&g_rt_key, ios_rt_thread_exit); }
+
+static struct ios_rt_thread *ios_rt_self(int create)
+{
+    struct ios_rt_thread *t;
+    pthread_once(&g_rt_once, ios_rt_key_init);
+    if ((t = pthread_getspecific(g_rt_key)) || !create) return t;
+    if (!(t = calloc(1, sizeof(*t)))) return NULL;
+    t->alive = 1;
+    t->port = mach_thread_self();
+    t->tid = ios_current_tid();
+    if (pthread_setspecific(g_rt_key, t)) {
+        mach_port_deallocate(mach_task_self(), t->port);
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
+static uint64_t ios_rt_cpu_us(mach_port_t port)
+{
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &count)) return 0;
+    return (uint64_t)(info.user_time.seconds + info.system_time.seconds) * 1000000u +
+           info.user_time.microseconds + info.system_time.microseconds;
+}
+
+static int ios_rt_check_self(struct ios_stream *s, struct ios_rt_thread *t)
+{
+    uint64_t now = mach_absolute_time(), cpu, wall_us;
+    unsigned int percent;
+    if (mach_to_ns(now - t->check_mach) < IOS_RT_CHECK_NS) return 1;
+    cpu = ios_rt_cpu_us(t->port);
+    wall_us = mach_to_ns(now - t->check_mach) / 1000;
+    percent = wall_us && cpu > t->check_cpu_us ? (unsigned int)((cpu - t->check_cpu_us) * 100 / wall_us) : 0;
+    t->check_mach = now;
+    t->check_cpu_us = cpu;
+    pthread_mutex_lock(&g_rt_lock);
+    if (percent > IOS_RT_MAX_CPU_PERCENT) {
+        t->refused = 1;
+        if (s->rt == t) { s->rt = NULL; t->streams--; }
+        ios_rt_demote_locked(t, "cpu");
+        pthread_mutex_unlock(&g_rt_lock);
+        fprintf(stderr, "[ios_audio] rt refused tid=0x%llx cpu=%u%%\n", t->tid, percent);
+        return 0;
+    }
+    if (atomic_load_explicit(&t->promoted, memory_order_relaxed)) {
+        thread_time_constraint_policy_data_t tc;
+        mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+        boolean_t get_default = FALSE;
+        if (!thread_policy_get(t->port, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tc, &count, &get_default) &&
+            get_default) {
+            kern_return_t kr = ios_rt_set_policy(t->port, 1);
+            if (g_audio_diag) fprintf(stderr, "[ios_audio] rt reassert tid=0x%llx kr=%d\n", t->tid, kr);
+        }
+    }
+    pthread_mutex_unlock(&g_rt_lock);
+    if (g_audio_diag)
+        fprintf(stderr, "[ios_audio] rt producer tid=0x%llx cpu=%u%% interval=%d cycles=%llu cycle_errors=%llu\n",
+                t->tid, percent, t->joined, (unsigned long long)t->cycles, (unsigned long long)t->cycle_errors);
+    return 1;
+}
+
+static void ios_audio_rt_producer(struct ios_stream *s, int new_producer)
+{
+    struct ios_rt_thread *t;
+
+    if (!g_rt_on || !ios_stream_is_live(s)) return;
+    if (!(t = ios_rt_self(new_producer))) return;
+    if (new_producer) {
+        pthread_mutex_lock(&g_rt_lock);
+        if (s->rt != t && s->started && !t->refused) {
+            if (s->rt) ios_rt_release_locked(s->rt, "producer changed");
+            s->rt = t;
+            t->streams++;
+            if (!atomic_load_explicit(&t->promoted, memory_order_relaxed)) {
+                kern_return_t kr = ios_rt_set_policy(t->port, 1);
+                atomic_store_explicit(&t->promoted, kr == KERN_SUCCESS, memory_order_relaxed);
+                t->check_mach = mach_absolute_time();
+                t->check_cpu_us = ios_rt_cpu_us(t->port);
+                if (g_audio_diag || kr)
+                    fprintf(stderr, "[ios_audio] rt promote stream=%p tid=0x%llx kr=%d\n",
+                            (void *)s, t->tid, kr);
+            }
+        }
+        pthread_mutex_unlock(&g_rt_lock);
+    }
+    if (atomic_load_explicit(&t->promoted, memory_order_relaxed) && ios_rt_check_self(s, t))
+        ios_rt_join_self(t);
+    else
+        ios_rt_leave_self(t);
+}
+
+static void ios_audio_rt_cycle_start(void)
+{
+    struct ios_rt_thread *t;
+    uint64_t now;
+    if (!g_rt_on || !(t = ios_rt_self(0)) || !t->joined) return;
+    ios_rt_finish_self(t);
+    now = mach_absolute_time();
+    if (os_workgroup_interval_start(t->wi, now, now + ios_ns_to_mach(IOS_RT_CONSTRAINT_NS), NULL)) {
+        t->cycle_errors++;
+        return;
+    }
+    t->in_cycle = 1;
+    t->cycles++;
+}
+
+static void ios_audio_rt_cycle_finish(void)
+{
+    struct ios_rt_thread *t;
+    if (!g_rt_on || !(t = ios_rt_self(0)) || !t->joined) return;
+    ios_rt_finish_self(t);
+    if (!atomic_load_explicit(&t->promoted, memory_order_relaxed)) ios_rt_leave_self(t);
+}
+
+static void ios_audio_rt_caller(void)
+{
+    struct ios_rt_thread *t;
+    if (g_rt_on && (t = ios_rt_self(0)) && t->joined && !atomic_load_explicit(&t->promoted, memory_order_relaxed))
+        ios_rt_leave_self(t);
+}
+
+static void ios_audio_rt_drop(struct ios_stream *s, const char *why)
+{
+    pthread_mutex_lock(&g_rt_lock);
+    if (s->rt) ios_rt_release_locked(s->rt, why);
+    s->rt = NULL;
+    pthread_mutex_unlock(&g_rt_lock);
+    ios_audio_rt_caller();
+}
+
 /* ml738: this driver is a documented singleton -- see the comment on
  * struct ios_stream. One title opens TWO concurrent render streams with
  * different formats (48k/2ch PCM16, then 48k/2ch float32), which is exactly
@@ -578,6 +856,11 @@ static _Atomic uint32_t g_call_counter[NULL_AUDIO_FN_COUNT];
 static uint64_t mach_to_ns(uint64_t mach) {
     if (!g_timebase.denom) mach_timebase_info(&g_timebase);
     return mach * g_timebase.numer / g_timebase.denom;
+}
+
+static uint64_t ios_ns_to_mach(uint64_t ns) {
+    if (!g_timebase.denom) mach_timebase_info(&g_timebase);
+    return ns * g_timebase.denom / g_timebase.numer;
 }
 
 static uint64_t elapsed_ns_since(uint64_t mach_start) {
@@ -800,13 +1083,10 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
     atomic_store_explicit(&s->play_pos, play + need, memory_order_release);
 
     /* ml1230: an underrun is heard as a click; count them */
-    atomic_fetch_add_explicit(&s->st_cbs, 1, memory_order_relaxed);
     if (need < want) {
         atomic_fetch_add_explicit(&s->st_short, want - need, memory_order_relaxed);
         atomic_fetch_add_explicit(&s->st_short_cbs, 1, memory_order_relaxed);
     }
-    if (nframes > atomic_load_explicit(&s->st_cb_max, memory_order_relaxed))
-        atomic_store_explicit(&s->st_cb_max, nframes, memory_order_relaxed);
 }
 
 /* Madeira audio pause (the in-game menu's Pause): while the game is paused the endpoint plays silence and mixes no stream, so no client's
@@ -1391,6 +1671,15 @@ static NTSTATUS ios_process_attach(void *args) {
     (void)args;
     pthread_mutex_init(&g_streams_lock, NULL);
     if (!g_timebase.denom) mach_timebase_info(&g_timebase);
+    {
+        const char *rt = getenv("MADEIRA_AUDIO_RT");
+        const char *rf = getenv("MADEIRA_AUDIO_REFILL");
+        g_audio_diag = !getenv("MADEIRA_NO_DIAGNOSTICS");
+        g_rt_on = !(rt && !strcmp(rt, "0"));
+        g_refill_on = !(rf && !strcmp(rf, "0"));
+        if (!g_rt_on) fprintf(stderr, "[ios_audio] rt producer promotion off (MADEIRA_AUDIO_RT=0)\n");
+        if (!g_refill_on) fprintf(stderr, "[ios_audio] underrun refill off (MADEIRA_AUDIO_REFILL=0)\n");
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1415,6 +1704,7 @@ static NTSTATUS ios_process_detach(void *args) {
              * leaving the memory is the safe trade. */
             s->valid = 0;
             s->started = 0;
+            ios_audio_rt_drop(s, "process detach");
             ios_dev_detach(s);
         }
     }
@@ -1583,6 +1873,7 @@ static NTSTATUS ios_release_stream(void *args) {
      * about to free. Nothing here touches another client's stream. */
     s->valid = 0;
     s->started = 0;
+    ios_audio_rt_drop(s, "release");
     if (p->timer_thread) {
         NtWaitForSingleObject(p->timer_thread, FALSE, NULL);
         NtClose(p->timer_thread);
@@ -1607,6 +1898,10 @@ static NTSTATUS ios_start(void *args) {
          * already sees this client. */
         s->start_mach = mach_absolute_time();
         s->drain_mach = s->start_mach;   /* MADEIRA_AUDIO_RESUME: a drain counts from this start */
+        s->caller_run = 0;
+        s->producer_tid = 0;
+        atomic_store_explicit(&s->short_history, 0, memory_order_relaxed);
+        atomic_store_explicit(&s->refill_callbacks, 0, memory_order_relaxed);
         s->started = 1;
         ios_dev_start();
     }
@@ -1621,6 +1916,7 @@ static NTSTATUS ios_stop(void *args) {
     if (s->started) {
         s->accumulated_frames = elapsed_frames(s);
         s->started = 0;
+        ios_audio_rt_drop(s, "stop");
         ios_dev_stop_if_idle();
     }
     p->result = S_OK;
@@ -1639,6 +1935,7 @@ static NTSTATUS ios_reset(void *args) {
     atomic_store(&s->play_pos, 0);
     s->pending_frames = 0;
     p->result = S_OK;
+    ios_audio_rt_cycle_finish();
     return STATUS_SUCCESS;
 }
 
@@ -1800,7 +2097,21 @@ static NTSTATUS ios_get_render_buffer(void *args) {
     LOG_FN_CALL(10, "get_render_buffer");
     struct get_render_buffer_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
+    int producer;
     if (!s) { if (p->data) *p->data = NULL; p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
+    {
+        uint64_t tid = ios_current_tid();
+        int new_producer = ios_producer_note(s, tid);
+        if (new_producer && g_audio_diag && s->producer_lines < IOS_PRODUCER_LINES) {
+            s->producer_lines++;
+            fprintf(stderr, "[ios_audio] getbuf-producer stream=%p tid=0x%llx frames=%u switches=%llu\n",
+                    (void *)s, (unsigned long long)tid, p->frames,
+                    (unsigned long long)atomic_load_explicit(&s->caller_switches, memory_order_relaxed));
+        }
+        producer = s->started && tid == s->producer_tid;
+        if (producer) ios_audio_rt_producer(s, new_producer);
+        else ios_audio_rt_caller();
+    }
     if (ios_stream_is_live(s)) {
         uint64_t padding = atomic_load(&s->write_pos) - atomic_load(&s->play_pos);
         if (p->frames + padding > s->buffer_frames) {
@@ -1842,6 +2153,7 @@ static NTSTATUS ios_get_render_buffer(void *args) {
         memset(s->render_scratch, 0, (size_t)p->frames * s->frame_bytes);
     if (p->data) *p->data = s->render_scratch;
     p->result = S_OK;
+    if (producer) ios_audio_rt_cycle_start();
     return STATUS_SUCCESS;
 }
 
@@ -1909,6 +2221,7 @@ static NTSTATUS ios_release_render_buffer(void *args) {
     }
     s->pending_frames = 0;
     p->result = S_OK;
+    ios_audio_rt_cycle_finish();
     return STATUS_SUCCESS;
 }
 

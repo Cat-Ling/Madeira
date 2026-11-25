@@ -11571,6 +11571,129 @@ static void ios_decline_foreign_fault( int sig, const void *pc, const void *addr
     }
     signal( sig, SIG_DFL );
 }
+
+/* Playport (PLA-880): SIGABRT from host code on a thread with a TEB is adopted
+ * as EXCEPTION_WINE_ASSERTION (0x80000101), bypassing iOS crash reporting.
+ * Capture __crash_info annotations and the host frame chain safely via
+ * mach_vm_read_overwrite before setup_exception runs. */
+#include "pp_abort_why.h"
+
+static int ios_abort_read_frame( uint64_t addr, uint64_t frame[2], void *ctx )
+{
+    mach_vm_size_t got = 0;
+
+    (void)ctx;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, 2 * sizeof(uint64_t),
+                                   (mach_vm_address_t)frame, &got ) == KERN_SUCCESS &&
+           got == 2 * sizeof(uint64_t);
+}
+
+static void ios_abort_read_str( uint64_t addr, char *buf, size_t size )
+{
+    size_t have = 0;
+
+    while (have + 1 < size)
+    {
+        uint64_t at = addr + have;
+        size_t n = 0x4000 - (size_t)(at & 0x3fff);
+        mach_vm_size_t got = 0;
+
+        if (n > size - 1 - have) n = size - 1 - have;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)at, n,
+                                    (mach_vm_address_t)(buf + have), &got ) != KERN_SUCCESS || got != n)
+            break;
+        if (memchr( buf + have, 0, n )) return;
+        have += n;
+    }
+    buf[have] = 0;
+}
+
+static uint64_t ios_abort_strip( uint64_t p )
+{
+    register uint64_t lr __asm__( "x30" ) = p;
+
+    __asm__ volatile( "xpaclri" : "+r"(lr) );
+    return lr;
+}
+
+static void ios_log_host_abort( ucontext_t *context )
+{
+    extern void *ios_jit_rx_base_global;
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern int ios_jit_low_contains( uintptr_t a );
+    extern int ios_jit_low_rw_contains( uintptr_t a );
+    static int said;
+    uintptr_t pc = (uintptr_t)PC_sig( context );
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t sz = ios_jit_pool_size_global;
+    uint64_t ret[24];
+    unsigned count, i, n, found = 0;
+    char text[512];
+
+    if ((sz && rx && pc >= rx && pc < rx + sz) || (sz && rw && pc >= rw && pc < rw + sz) ||
+        ios_jit_low_contains( pc ) || ios_jit_low_rw_contains( pc ) ||
+        (pc >= 0x7000000000ull && pc < 0x8000000000ull))
+        return;
+    if (said++ || getenv( "MADEIRA_NO_DIAGNOSTICS" )) return;
+
+    dprintf( 2, "[abort-why] SIGABRT from host code on tid %04x, adopted as "
+                "EXCEPTION_WINE_ASSERTION (0x80000101); abort annotations:\n",
+             NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0 );
+    count = _dyld_image_count();
+    for (i = 0; i < count; i++)
+    {
+        struct ppaw_crash_info info;
+        uint64_t addr, size, msgs[2], cause;
+        mach_vm_size_t got = 0;
+        const char *name, *slash;
+        unsigned m, k;
+
+        if (!ppaw_find_section( _dyld_get_image_header( i ), _dyld_get_image_vmaddr_slide( i ),
+                                "__crash_info", &addr, &size ))
+            continue;
+        if (size > sizeof(info)) size = sizeof(info);
+        memset( &info, 0, sizeof(info) );
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, size,
+                                    (mach_vm_address_t)&info, &got ) != KERN_SUCCESS)
+            continue;
+        m = ppaw_crash_messages( &info, got, msgs, &cause );
+        if (!m && !cause) continue;
+        name = _dyld_get_image_name( i );
+        slash = name ? strrchr( name, '/' ) : NULL;
+        name = slash ? slash + 1 : name ? name : "?";
+        for (k = 0; k < m; k++)
+        {
+            ios_abort_read_str( msgs[k], text, sizeof(text) );
+            dprintf( 2, "[abort-why] %s: %s\n", name, text );
+        }
+        if (cause) dprintf( 2, "[abort-why] %s: abort cause %llu\n", name, (unsigned long long)cause );
+        found++;
+    }
+    if (!found) dprintf( 2, "[abort-why] no library left a message\n" );
+
+    ret[0] = pc;
+    ret[1] = LR_sig( context );
+    n = 2 + ppaw_walk( FP_sig( context ), ios_abort_read_frame, NULL, ret + 2, 22 );
+    for (i = 0; i < n; i++)
+    {
+        uint64_t a = i ? ios_abort_strip( ret[i] ) : ret[i];
+        Dl_info dl;
+
+        if (dladdr( (void *)(uintptr_t)a, &dl ) && dl.dli_fname)
+        {
+            const char *file = strrchr( dl.dli_fname, '/' );
+            file = file ? file + 1 : dl.dli_fname;
+            if (dl.dli_sname)
+                dprintf( 2, "[abort-why] #%u 0x%llx %s`%s+0x%llx\n", i, (unsigned long long)a, file,
+                         dl.dli_sname, (unsigned long long)(a - (uintptr_t)dl.dli_saddr) );
+            else
+                dprintf( 2, "[abort-why] #%u 0x%llx %s+0x%llx\n", i, (unsigned long long)a, file,
+                         (unsigned long long)(a - (uintptr_t)dl.dli_fbase) );
+        }
+        else dprintf( 2, "[abort-why] #%u 0x%llx\n", i, (unsigned long long)a );
+    }
+}
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -16337,6 +16460,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     EXCEPTION_RECORD rec = { 0 };
 #ifdef WINE_IOS
     ios_track_signal( signal, sigcontext );
+    ios_log_host_abort( (ucontext_t *)sigcontext );
 #endif
 
     switch (siginfo->si_code & 0xffff )
@@ -16397,6 +16521,7 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     HANDLE handle;
 #ifdef WINE_IOS
     ios_track_signal( signal, sigcontext );
+    ios_log_host_abort( (ucontext_t *)sigcontext );
 #endif
 
     if (!p__wine_ctrl_routine)
@@ -16442,6 +16567,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
     ios_track_signal( signal, sigcontext );
+    ios_log_host_abort( (ucontext_t *)sigcontext );
 #endif
     setup_exception( sigcontext, &rec );
 }

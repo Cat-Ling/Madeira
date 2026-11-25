@@ -103,6 +103,8 @@ static int ios_pool_mach_region(uint64_t *addr, uint64_t *size, unsigned *prot)
 static int ios_pool_execable_runs(uint64_t rx, size_t off, size_t size, ios_pool_region_fn fn,
                                  size_t *ro, size_t *rs, int max)
 { (void)rx; (void)off; (void)size; (void)fn; (void)ro; (void)rs; (void)max; return 0; }
+static void ios_pool_room_claim(size_t off, size_t size)
+{ (void)off; (void)size; }
 ''' + helpers + allocator + r'''
 static int poison, probes;
 static unsigned ios_pool_check_range_exec(size_t off, size_t size, int reused)

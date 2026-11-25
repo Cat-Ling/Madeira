@@ -711,6 +711,113 @@ extern void *ios_jit_rx_base_global;  /* defined below */
  * both the experiment (faults vanish => theory confirmed) and the mitigation. */
 static volatile size_t ios_jit_tail_reserved;   /* defined below (tail EC_CODE carve) */
 extern size_t ios_jit_pool_size_global;         /* defined below */
+
+/* Playport (PLA-846, decision 0184): zero-footprint untouched JIT pool room.
+ * Adapted for Madeira's split-pool layout by pre-marking IOS_POOL_IN_HOLE pages. */
+#include "pp_jit_room.h"
+#ifndef MADV_FREE_REUSABLE
+#define MADV_FREE_REUSABLE 7
+#endif
+static struct ppjr ios_pool_room;
+static pthread_mutex_t ios_pool_room_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned long ios_pool_room_take( void *ctx, size_t off, size_t len )
+{
+    volatile unsigned char *rx = (volatile unsigned char *)ios_jit_rx_base_global + off;
+    volatile unsigned char *rw = (volatile unsigned char *)ios_jit_rw_base_global + off;
+    unsigned long gone = 0;
+    size_t o;
+
+    (void)ctx;
+    madvise( (char *)ios_jit_rw_base_global + off, len, MADV_FREE_REUSE );
+    for (o = 0; o < len; o += PPJR_PAGE)
+    {
+        unsigned char b = rx[o];
+        if (b != 0x69) gone++;
+        rw[o] = b;
+    }
+    return gone;
+}
+
+static void ios_pool_room_claim( size_t off, size_t size )
+{
+    unsigned long before;
+
+    pthread_mutex_lock( &ios_pool_room_lock );
+    before = ios_pool_room.taken;
+    ppjr_claim( &ios_pool_room, off, size, ios_pool_room_take, NULL );
+    if (ios_pool_room.taken != before)
+    {
+        static unsigned n;
+        if (n < 16 || !(n & (n - 1)))
+            dprintf( 2, "[jit-pool] room: off=0x%lx+0x%lx: %lu page(s) reclaimed by iOS faulted back via RX "
+                        "(%lu of %lu claimed)\n",
+                     (unsigned long)off, (unsigned long)size, ios_pool_room.taken - before,
+                     ios_pool_room.taken, ios_pool_room.claims );
+        n++;
+    }
+    pthread_mutex_unlock( &ios_pool_room_lock );
+}
+
+static void ios_pool_room_init( size_t size, size_t first )
+{
+    const char *env = getenv( "MADEIRA_JIT_POOL_ROOM" );
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    unsigned long long was = 0, now = 0;
+    unsigned char *bits;
+    struct ppjr room;
+    int rc = 0, err = 0;
+    size_t off;
+
+    if (env && !strcmp( env, "0" ))
+    {
+        dprintf( 2, "[jit-pool] room: off (MADEIRA_JIT_POOL_ROOM=0)\n" );
+        return;
+    }
+    bits = calloc( (size / PPJR_PAGE + 7) / 8, 1 );
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
+        was = vmi.phys_footprint;
+    pthread_mutex_lock( &ios_pool_room_lock );
+    if (!bits || ppjr_init( &room, bits, size, first ) != 0)
+    {
+        rc = -1;
+    }
+    else
+    {
+        /* Skip split-pool PROT_NONE holes: never touch or madvise hole pages. */
+        off = first;
+        while (off < size)
+        {
+            size_t run_end;
+            if (IOS_POOL_IN_HOLE( off ))
+            {
+                size_t hole_start = off;
+                while (off < size && IOS_POOL_IN_HOLE( off )) off += PPJR_PAGE;
+                ppjr_mark_claimed( &room, hole_start, off - hole_start );
+                continue;
+            }
+            run_end = off;
+            while (run_end < size && !IOS_POOL_IN_HOLE( run_end )) run_end += PPJR_PAGE;
+            if (madvise( (char *)ios_jit_rw_base_global + off, run_end - off, MADV_FREE_REUSABLE ) != 0)
+            {
+                rc = -1;
+                err = errno;
+                break;
+            }
+            off = run_end;
+        }
+    }
+    if (!rc) ios_pool_room = room;
+    else free( bits );
+    pthread_mutex_unlock( &ios_pool_room_lock );
+    cnt = TASK_VM_INFO_COUNT;
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
+        now = vmi.phys_footprint;
+    dprintf( 2, "[jit-pool] room: 0x%lx bytes from pool+0x%lx %s (madvise rc=%d errno=%d); footprint %llu -> %llu MB\n",
+             (unsigned long)(size - first), (unsigned long)first,
+             rc ? "stay in the footprint" : "out of the footprint until first use", rc, err, was >> 20, now >> 20 );
+}
 /* task #35 THE MEASUREMENT THAT DECIDES THE WHOLE PLAN.
  *
  * Everything else about the furniture ceiling is instrumentation of a means to
@@ -1125,13 +1232,15 @@ static void *ios_pool_warmer_thread( void *arg )
             if (tail > total) tail = total;
             /* madeira-bcd split pool: the hole is not pool memory (its RW side
              * is PROT_NONE, its RX side the main thread's stack) -- skip it. */
-            for (o = 0; o < head; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rw[o]; touched++; }
-            for (o = total - tail; o < total; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rw[o]; touched++; }
+            /* Playport (PLA-846): touch RX before RW so any page iOS reclaimed
+             * faults through the blessed RX mapping first. */
             if (rx)
             {
                 for (o = 0; o < head; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rx[o]; touched++; }
                 for (o = total - tail; o < total; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rx[o]; touched++; }
             }
+            for (o = 0; o < head; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rw[o]; touched++; }
+            for (o = total - tail; o < total; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rw[o]; touched++; }
             /* madeira-bcd pool-low: region C's carved part holds FEX code buffers
              * exactly like the tail -- warm both of its aliases too. */
             if (ios_jit_low_size_global)
@@ -1145,8 +1254,16 @@ static void *ios_pool_warmer_thread( void *arg )
             (void)sink;
             cycle++;
             if (cycle == 1 || (cycle % 30) == 0)
+            {
                 dprintf(2, "[pool-warmer] cycle=%u touched=%lu pages (head=0x%lx tail=0x%lx)\n",
                         cycle, (unsigned long)touched, (unsigned long)head, (unsigned long)tail);
+                pthread_mutex_lock( &ios_pool_room_lock );
+                if (ios_pool_room.claimed)
+                    dprintf(2, "[jit-pool] room: %lu MiB out of footprint; %lu claimed, %lu reclaimed by iOS\n",
+                            (unsigned long)(ppjr_room_bytes( &ios_pool_room ) >> 20),
+                            ios_pool_room.claims, ios_pool_room.taken);
+                pthread_mutex_unlock( &ios_pool_room_lock );
+            }
             {
                 extern void ios_wow_pressure_tick( unsigned cycle );
                 ios_wow_pressure_tick( cycle );   /* ml2030: idle 32-bit placeholders back under band pressure */
@@ -3369,6 +3486,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                             (unsigned long)cand, (unsigned long)below);
             }
             off = cand;
+            ios_pool_room_claim( off, alloc_size );
             jit_pool_offset = cand + alloc_size;
             ios_pool_last_alloc_reused = 0;
             /* ml89 CONTROL for the POISONED check above: report the same
@@ -3397,6 +3515,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     if (off != (size_t)-1)
     {
+        ios_pool_room_claim( off, alloc_size );
         /* Steam S3 run 9/10: purge STALE anon-alias entries whose pool range
          * overlaps the handed-out range. Aliases are only cleared on process
          * EXIT — a live process (steam.exe) that guest-frees an anon RWX
@@ -19041,6 +19160,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
                 ERR("iOS JIT pool: RX=%p RW=%p size=0x%lx\n",
                     jit_rx_base, jit_rw_base, (unsigned long)jit_pool_size);
+                ios_pool_room_init( jit_pool_size, jit_pool_offset );
             }
             jit_pool_init_done = 1;
         }
@@ -34735,6 +34855,7 @@ retry_code_carve_reuse:
         {
             void *jit_rx = (char *)ios_jit_rx_base_global + pool_tail_off;
             void *jit_rw = (char *)ios_jit_rw_base_global + pool_tail_off;
+            ios_pool_room_claim( pool_tail_off, alloc_size );
 
             /* tail-carve exec check: REFUSE A CARVE WHOSE FIRST PAGES CANNOT EXECUTE.
              *

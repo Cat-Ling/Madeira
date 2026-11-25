@@ -1,0 +1,111 @@
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index 83f36c0..193f675 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -4,6 +4,7 @@
+ #include "d3d11_resource.hpp"
+ #include "d3d11_1.h"
+ #include "util_math.hpp"
++#include "util_env.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -369,8 +370,15 @@ CreateMTLTextureDescriptorInternal(
+   }
+ 
+   if (metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) {
+-    // well this is necessary for passing validation layer
+-    metal_usage |= WMTTextureUsagePixelFormatView;
++    /* Playport: WMTTextureUsagePixelFormatView disables Apple's lossless
++     * framebuffer compression on GPU family 5+, and Unity uses TYPELESS render
++     * textures; keep the flag only for DXMT_TYPELESS_PFV=1, depth/stencil
++     * planar views, or block-compressed formats. */
++    static const bool always_pfv = env::getEnvVar("DXMT_TYPELESS_PFV") == "1";
++    if (always_pfv ||
++        (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
++                              MTL_DXGI_FORMAT_BC)))
++      metal_usage |= WMTTextureUsagePixelFormatView;
+   }
+ 
+   if (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) {
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 65ee79a..6c9e491 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -19,15 +19,15 @@
+ namespace dxmt {
+ 
+ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
++    device_(device),
++    queue_(queue),
+     emulated_cmd(device, lib, *this),
+     clear_rt_cmd(device, lib, *this),
+     blit_depth_stencil_cmd(device, lib, *this),
+     clear_res_cmd(device, lib, *this),
+     mv_scale_cmd(device, lib, *this),
+     resolve_texture_cmd(device, lib, *this),
+-    stretch_blit_cmd(device, lib, *this),
+-    device_(device),
+-    queue_(queue) {
++    stretch_blit_cmd(device, lib, *this) {
+   dummy_sampler_info_.support_argument_buffers = true;
+   dummy_sampler_info_.border_color = WMTSamplerBorderColorTransparentBlack;
+   dummy_sampler_info_.compare_function = WMTCompareFunctionNever;
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index dae3218..4568768 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -882,6 +882,13 @@ public:
+ 
+   uint32_t tess_num_output_control_point_element;
+   uint32_t tess_threads_per_patch;
++  /* madeira-bcd tess-pso-failed-v1 (round 626; tools/patch-dxmt-tess-pso-failed.py): the last tessellation / geometry mesh pipeline
++   * this context set did not compile; the mesh draws of that kind that follow are dropped (d3d11_context_impl.cpp). */
++  bool tess_pso_failed = false;
++  bool gs_pso_failed = false;
++
++  WMT::Device device_;
++  CommandQueue& queue_;
+ 
+   EmulatedCommandContext emulated_cmd;
+   ClearRenderTargetContext clear_rt_cmd;
+@@ -967,9 +974,6 @@ private:
+   Flags<FeatureCompatibility> compatibility_flag_;
+ 
+   std::vector<Rc<VisibilityResultQuery> *> deferred_visibility_query_stack_;
+-
+-  WMT::Device device_;
+-  CommandQueue& queue_;
+ };
+ 
+ template <>
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 82a53ec..c86b0fa 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -1,5 +1,7 @@
+ #include "dxmt_texture.hpp"
++#include "dxmt_format.hpp"
+ #include "dxmt_residency.hpp"
++#include "log/log.hpp"
+ #include "wsi_platform.hpp"
+ #include <atomic>
+ #include <cassert>
+@@ -31,6 +33,17 @@ TextureView::TextureView(TextureAllocation *allocation, TextureViewKey key, Text
+     allocation(allocation),
+     key(key) {
+   auto parent = allocation->texture();
++  /* Log up to 32 cross-format views created on colour typeless textures without pixelFormatView. */
++  if (!(allocation->descriptor->usage() & WMTTextureUsagePixelFormatView)) {
++    WMTPixelFormat from = static_cast<WMTPixelFormat>(allocation->descriptor->pixelFormat() & ~WMTPixelFormatAlphaIsOne);
++    WMTPixelFormat to = static_cast<WMTPixelFormat>(descriptor.format & ~WMTPixelFormatAlphaIsOne);
++    if (Forget_sRGB(from) != Forget_sRGB(to)) {
++      static std::atomic<unsigned> reported{0};
++      if (reported.fetch_add(1, std::memory_order_relaxed) < 32)
++        ERR("[pfv-view] texture format ", allocation->descriptor->pixelFormat(), " viewed as ", descriptor.format,
++            " without pixelFormatView");
++    }
++  }
+   texture = parent.newTextureView(
+       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
+       descriptor.firstArraySlice, descriptor.arraySize, descriptor.swizzle, gpuResourceID

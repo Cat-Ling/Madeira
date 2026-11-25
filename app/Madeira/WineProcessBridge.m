@@ -1148,6 +1148,17 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
              * and writes no log file unless DXVK_LOG_PATH names a folder;
              * overwrite=0 keeps a madeira.cfg env.DXVK_LOG_LEVEL. */
             setenv("DXVK_LOG_LEVEL", "info", 0);
+            /* Playport (decision 0066): KosmicKrisp replays secondary command buffers
+             * with high overhead under DXVK tilerMode; default it off unless user overrides. */
+            {
+                const char *cur_cfg = getenv("DXVK_CONFIG");
+                if (!cur_cfg || !cur_cfg[0]) {
+                    setenv("DXVK_CONFIG", "dxvk.tilerMode = False", 1);
+                } else if (!strcasestr(cur_cfg, "tilerMode")) {
+                    NSString *joined = [NSString stringWithFormat:@"%s; dxvk.tilerMode = False", cur_cfg];
+                    setenv("DXVK_CONFIG", joined.UTF8String, 1);
+                }
+            }
             level = getenv("DXVK_LOG_LEVEL");   /* DXVK's log level (none, error, warn, info, debug, trace); d3d11 = dxvk makes it info unless set */
             dprintf(STDERR_FILENO, "[vulkan] d3d11 = dxvk: DXVK's d3d11.dll, d3d10core.dll and dxgi.dll for this session "
                     "(links %d in %s); D3D12 = %s%s; DXVK_LOG_LEVEL=%s\n", dxvk_linked,
