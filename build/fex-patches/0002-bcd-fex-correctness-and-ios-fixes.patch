@@ -993,7 +993,7 @@ index 53889cae0442ec050b51dda756c3872736ecfb74..5e99d1a33c863d419bcd9d127a699d44
  
    // Default segment setup.
    auto Frame = Thread->CurrentFrame;
-@@ -1749,6 +1807,17 @@ void BTCpuThreadInit() {
+@@ -1707,6 +1765,17 @@ void BTCpuThreadInit() {
    }
  #endif
  
@@ -1009,5 +1009,5 @@ index 53889cae0442ec050b51dda756c3872736ecfb74..5e99d1a33c863d419bcd9d127a699d44
 +  }
 +#endif
    auto ThreadTID = GetCurrentThreadId();
-   Thread->FrontendPtr = new FrontendThreadData(
-     TLS, FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT));
+   Threads.emplace(ThreadTID, Thread);
+   if (StatAllocHandler) {
