@@ -35,3 +35,7 @@ licence (MIT).
   while `wsi_metal_layer_{make,remove}_queue_resident` only compiled on macOS 26. This patch enables
   the iOS 26 residency-set path so `CAMetalLayer` drawables are resident on the queue on iOS, and
   releases any overwritten `cmd->drawable` if a command buffer is re-recorded before submission.
+- `kosmickrisp-ios-0005-kk-use-vm-calls-on-ios.patch`: Mesa 26.3 added `kk_bo.c` placed-map calls
+  using `<mach/mach_vm.h>`, which the iOS SDK rejects (`mach_vm.h unsupported`). On
+  `TARGET_OS_IPHONE`, calls `vm_remap`, `vm_map`, and `vm_deallocate` from `<mach/vm_map.h>` instead
+  (ported from Playport `patches/mesa/0003`).
